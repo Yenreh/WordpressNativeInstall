@@ -30,6 +30,12 @@ services:
       WORDPRESS_TABLE_PREFIX: ${DEV_TABLE_PREFIX}
       WORDPRESS_HOME: ${DEV_URL}
       WORDPRESS_SITEURL: ${DEV_URL}
+      # Run apache as the host user so every file WordPress creates (uploads,
+      # plugin installs, core updates) stays editable from the host. The php
+      # apache image honours these, and the WordPress entrypoint chowns the
+      # document root to the same ids. '#' means "numeric id" for apache.
+      APACHE_RUN_USER: "#${DEV_UID}"
+      APACHE_RUN_GROUP: "#${DEV_GID}"
       # Development defaults: log to wp-content/debug.log, never to the page.
       WORDPRESS_CONFIG_EXTRA: |
         define('WP_DEBUG', true);
@@ -46,7 +52,12 @@ services:
     # On-demand WP-CLI: `bash bin/dev wp <args>`. Never started by `up`.
     image: ${DEV_CLI_IMAGE}
     profiles: ["cli"]
+    # Same identity as apache, so files created by WP-CLI match the rest.
+    user: "${DEV_UID}:${DEV_GID}"
     environment:
+      # The image default HOME is www-data's; with a custom uid it may not be
+      # writable, and WP-CLI wants somewhere for its cache.
+      HOME: /tmp
       WORDPRESS_DB_HOST: ${DEV_DB_HOST}:${DB_PORT}
       WORDPRESS_DB_NAME: ${DB_NAME}
       WORDPRESS_DB_USER: ${DB_USER}

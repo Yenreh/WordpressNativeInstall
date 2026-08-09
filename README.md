@@ -208,9 +208,24 @@ DEV_THEME_DIRS="/home/user/GIT/my-theme"
 ```
 
 `bin/dev` renders these into `dev/<domain>/compose.override.yml` (gitignored) on
-every run. By default the document root itself lives in a Docker named volume,
-which avoids file-ownership friction; set `DEV_DOCROOT=/abs/path` to bind-mount
-the whole document root instead.
+every run.
+
+To browse and edit the whole installation from the host, bind-mount the
+document root:
+
+```sh
+DEV_DOCROOT="/home/user/dev/example.com"
+```
+
+The containers run as **your** uid/gid (derived from `SUDO_UID`/`SUDO_GID` when
+invoked through sudo, overridable with `DEV_UID`/`DEV_GID`): apache gets them
+through `APACHE_RUN_USER`/`APACHE_RUN_GROUP`, and the WordPress entrypoint
+chowns the document root to match. Everything WordPress writes — uploads,
+plugins installed from the dashboard, core updates — ends up owned by you, and
+`Unable to create directory wp-content/uploads/...` warnings disappear.
+
+Without `DEV_DOCROOT` the document root stays inside a Docker named volume,
+which is fine when you only reach the site through the browser and `bin/dev wp`.
 
 If your user is not in the `docker` group, `bin/dev` detects it and re-runs the
 Docker calls through `sudo` (pass `--no-sudo` to refuse).

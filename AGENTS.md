@@ -54,9 +54,17 @@ All executables live in `bin/` and take `--config sites/<domain>.env`. When
   so `write_override` in `bin/dev` generates `dev/<domain>/compose.override.yml`
   from `DEV_PLUGIN_DIRS`/`DEV_THEME_DIRS` on every run. `dev/` is gitignored;
   never hand-edit the generated file.
-- The document root defaults to a **named volume** (`DEV_WP_SOURCE=wp_data`) to
-  avoid uid-33 ownership problems; `DEV_DOCROOT=/abs/path` switches the same
-  compose entry to a bind mount.
+- The document root defaults to a **named volume** (`DEV_WP_SOURCE=wp_data`);
+  `DEV_DOCROOT=/abs/path` switches the same compose entry to a bind mount.
+- Containers run as the invoking human (`DEV_UID`/`DEV_GID`, taken from
+  `SUDO_UID`/`SUDO_GID` when present). apache picks it up via
+  `APACHE_RUN_USER`/`APACHE_RUN_GROUP` — the `#` prefix means "numeric id" and
+  the php-apache image rewrites `envvars` so those variables are honoured — and
+  the cli service through `user:`. Removing this reintroduces uid-33 files in a
+  bind-mounted docroot and `Unable to create directory` warnings on install.
+- `wp_cli` passes `wp` explicitly to `docker compose run`: the image entrypoint
+  only prepends it when `wp help <arg>` succeeds, which fails for some
+  subcommands (`db check` died as `exec: db: not found`).
 
 ## Conventions that matter
 

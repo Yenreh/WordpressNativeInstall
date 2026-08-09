@@ -163,10 +163,15 @@ derive_dev_config() {
     # at the same database server.
     DEV_TABLE_PREFIX="${DEV_TABLE_PREFIX:-wp_}"
 
-    # Empty DEV_DOCROOT means "use a named volume" (no file-ownership friction).
-    # Set it to an absolute path to bind-mount the document root instead.
+    # Empty DEV_DOCROOT means "use a named volume". Set an absolute path to
+    # bind-mount the document root and browse/edit the files from the host.
     DEV_DOCROOT="${DEV_DOCROOT:-}"
     DEV_WP_SOURCE="${DEV_DOCROOT:-wp_data}"
+
+    # Identity the containers run as, so bind-mounted files belong to the human
+    # driving them. Under sudo the real user is in SUDO_UID/SUDO_GID.
+    DEV_UID="${DEV_UID:-${SUDO_UID:-$(id -u)}}"
+    DEV_GID="${DEV_GID:-${SUDO_GID:-$(id -g)}}"
 
     # Colon-separated absolute paths, mounted into wp-content/{plugins,themes}.
     DEV_PLUGIN_DIRS="${DEV_PLUGIN_DIRS:-}"

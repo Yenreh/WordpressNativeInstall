@@ -130,12 +130,16 @@ write_override() {
     OVERRIDE_ARGS=(-f "$file")
 }
 
+COMPOSE_EXTRA=()
+
 compose() {
     export DB_NAME DB_USER DB_PASSWORD DB_PORT
     export DEV_DB_HOST DEV_TABLE_PREFIX
     export DEV_WP_IMAGE DEV_CLI_IMAGE
     export DEV_BIND_ADDR DEV_HTTP_PORT DEV_URL DEV_WP_SOURCE
+    export DEV_UID DEV_GID
     "${DOCKER_PREFIX[@]}" docker compose \
+        ${COMPOSE_EXTRA[@]+"${COMPOSE_EXTRA[@]}"} \
         -p "$DEV_PROJECT_NAME" \
         -f "$COMPOSE_FILE" \
         "${OVERRIDE_ARGS[@]}" \
@@ -143,7 +147,13 @@ compose() {
 }
 
 wp_cli() {
-    compose --profile cli run --rm -T cli "$@"
+    # `wp` is passed explicitly: the image entrypoint only prepends it when it
+    # recognizes the first argument as a wp-cli subcommand, and that detection
+    # is unreliable (it fails with "exec: db: not found" for `db check`).
+    # `--progress quiet` keeps the per-run container chatter out of the output.
+    # shellcheck disable=SC2034  # read by compose() through dynamic scoping
+    local -a COMPOSE_EXTRA=(--progress quiet)
+    compose --profile cli run --rm -T cli wp "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -156,11 +166,12 @@ cmd_up() {
         [ "$arg" = "--no-install" ] && do_install=false
     done
 
-    # Bind-mounted docroot: create it as the invoking user, before any sudo
-    # docker call would create it as root.
+    # Bind-mounted docroot: create it up front and hand it to the real user,
+    # otherwise running under sudo would leave a root-owned directory.
     if [ -n "${DEV_DOCROOT:-}" ]; then
         mkdir -p "$DEV_DOCROOT"
-        info "Bind-mounted document root: ${DEV_DOCROOT}"
+        chown "${DEV_UID}:${DEV_GID}" "$DEV_DOCROOT" 2>/dev/null || true
+        info "Bind-mounted document root: ${DEV_DOCROOT} (owner ${DEV_UID}:${DEV_GID})"
     fi
 
     step "Starting the development stack (${DEV_PROJECT_NAME})"
@@ -180,20 +191,35 @@ cmd_up() {
     done
 
     step "Checking database connectivity from the container"
-    if wp_cli db check >/dev/null 2>&1; then
+    local check_output
+    if check_output="$(wp_cli db check 2>&1)"; then
         ok "Connected to ${DB_NAME} at ${DEV_DB_HOST}:${DB_PORT}"
     else
-        err "Cannot reach the database ${DB_NAME} at ${DEV_DB_HOST}:${DB_PORT} as ${DB_USER}."
+        err "The database check failed. Reported error:"
         echo ""
-        echo "    The database is external and must exist before starting the stack:"
-        echo "      CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-        echo "      CREATE USER '${DB_USER}'@'%' IDENTIFIED BY '<the DB_PASSWORD from your site config>';"
-        echo "      GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%';"
+        printf '      %s\n' "$check_output"
         echo ""
-        echo "    Also make sure the server accepts connections from the container:"
-        echo "      - MariaDB on the host must not bind to 127.0.0.1 only (bind-address)."
-        echo "      - The grant host must cover the Docker bridge network, not just localhost."
-        echo "      - Set DEV_DB_HOST in the site config for a remote server."
+
+        # Separate a network problem from an authentication/permission one.
+        info "Probing the TCP port from inside the container..."
+        if compose exec -T wordpress php -r \
+            "\$f = @fsockopen('${DEV_DB_HOST}', ${DB_PORT}, \$e, \$s, 5);
+             echo \$f ? 'reachable' : 'unreachable: ' . \$s;" 2>/dev/null | grep -q reachable
+        then
+            ok "${DEV_DB_HOST}:${DB_PORT} is reachable from the container — so this is not a network problem."
+            echo ""
+            echo "    Then the credentials or the grants are the issue:"
+            echo "      CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+            echo "      CREATE USER '${DB_USER}'@'%' IDENTIFIED BY '<the DB_PASSWORD from your site config>';"
+            echo "      GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%';"
+            echo "    A grant limited to 'localhost' does not cover the container."
+        else
+            err "${DEV_DB_HOST}:${DB_PORT} is NOT reachable from the container — this is a network problem."
+            echo ""
+            echo "      - MariaDB must not bind to 127.0.0.1 only (bind-address in the server config)."
+            echo "      - A firewall may be blocking the Docker bridge subnet."
+            echo "      - Set DEV_DB_HOST in the site config if the server needs another address."
+        fi
         echo ""
         die "Database unreachable."
     fi
