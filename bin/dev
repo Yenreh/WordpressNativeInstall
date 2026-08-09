@@ -89,6 +89,9 @@ require_docker() {
 write_override() {
     local dir="${DEV_STATE_DIR}"
     mkdir -p "$dir"
+    # Hand the state directory to the real user right away: under sudo it would
+    # otherwise stay root-owned, and this runs even when no override is written.
+    chown "${DEV_UID}:${DEV_GID}" "$dir" "$(dirname "$dir")" 2>/dev/null || true
     local file="${dir}/compose.override.yml"
 
     local entries=()
