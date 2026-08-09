@@ -339,10 +339,12 @@ that command.
 - Applied to every site: `wp-config.php` mode 640, `DISALLOW_FILE_EDIT`,
   `WP_DEBUG` off, PHP execution denied under `wp-content/uploads`, `xmlrpc.php`
   and dotfiles denied, HTTP redirected to HTTPS.
-- Each site gets a randomized table prefix (`DB_TABLE_PREFIX`, e.g. `wp_k3af_`).
-  Be clear-eyed about it: it only deflects canned payloads that hardcode `wp_`,
-  and stops nothing targeted. It is free, so it is on; set it back to `"wp_"`
-  whenever you prefer the convention. It must be chosen before installing.
+- The table prefix is `wp_` by default. `bin/new-site --random-prefix` writes a
+  per-site one instead (`wp_k3af_`), or set `DB_TABLE_PREFIX` by hand. Be
+  clear-eyed about it: it only deflects canned payloads that hardcode `wp_` and
+  stops nothing targeted, which is why it is opt-in. Either way it must be
+  chosen before installing — changing it later means renaming every table and
+  fixing the `*_user_roles` and `*_capabilities` keys.
 - `backups/` (database dumps) is gitignored as well.
 
 ---
