@@ -108,11 +108,22 @@ print_usage() {
     ' "$1"
 }
 
-# Generate a URL/shell-safe password (alphanumeric only, no quoting hazards).
+# generate_password [length] [tr-charset] - random string, alphanumeric by
+# default so it never needs quoting in SQL, YAML or the shell.
+#
+# /dev/urandom is read in bounded chunks instead of being piped into `head`:
+# that pipeline kills `tr` with SIGPIPE, and under `set -o pipefail` the
+# non-zero status aborts the caller intermittently.
 generate_password() {
     local length="${1:-24}"
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length"
-    echo
+    local charset="${2:-A-Za-z0-9}"
+    local out=""
+
+    while [ "${#out}" -lt "$length" ]; do
+        out+="$(LC_ALL=C tr -dc "$charset" < <(head -c 256 /dev/urandom))"
+    done
+
+    printf '%s\n' "${out:0:length}"
 }
 
 # MariaDB/MySQL client wrapper for root socket access (script already runs as root).

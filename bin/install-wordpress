@@ -167,6 +167,7 @@ create_wp_config() {
         --dbuser="$DB_USER" \
         --dbpass="$DB_PASSWORD" \
         --dbhost="${DB_HOST}:${DB_PORT}" \
+        --dbprefix="$DB_TABLE_PREFIX" \
         --dbcharset="utf8mb4" \
         --dbcollate="utf8mb4_unicode_ci" \
         --locale="$SITE_LOCALE" \
@@ -177,7 +178,7 @@ create_wp_config() {
     wp config set DISALLOW_FILE_EDIT true --raw --path="$WP_PATH" --allow-root
     wp config set FS_METHOD "direct" --path="$WP_PATH" --allow-root
 
-    ok "wp-config.php generated (WP_DEBUG=false, DISALLOW_FILE_EDIT=true, FS_METHOD=direct)"
+    ok "wp-config.php generated (table prefix '${DB_TABLE_PREFIX}', WP_DEBUG=false, DISALLOW_FILE_EDIT=true)"
 }
 
 # -----------------------------------------------------------------------------

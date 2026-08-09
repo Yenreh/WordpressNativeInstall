@@ -125,6 +125,14 @@ derive_site_config() {
         NGINX_ENABLED_LINK="/etc/nginx/sites-enabled/${NGINX_SITE_NAME}"
     fi
 
+    # Table prefix, applied at install time by `wp config create --dbprefix`.
+    # Only letters, digits and underscores: WordPress uses it as a raw SQL
+    # identifier. Changing it after the install requires renaming every table.
+    DB_TABLE_PREFIX="${DB_TABLE_PREFIX:-wp_}"
+    if [[ ! "$DB_TABLE_PREFIX" =~ ^[A-Za-z0-9_]+$ ]]; then
+        die "Invalid DB_TABLE_PREFIX '${DB_TABLE_PREFIX}': only letters, digits and underscores."
+    fi
+
     SITE_URL="https://${SITE_DOMAIN}"
     CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-64M}"
     WEB_USER="${WEB_USER:-www-data}"
@@ -159,9 +167,10 @@ derive_dev_config() {
         esac
     fi
 
-    # Keeps a dev install from colliding with production tables when both point
-    # at the same database server.
-    DEV_TABLE_PREFIX="${DEV_TABLE_PREFIX:-wp_}"
+    # Same prefix as production unless told otherwise, so a dump moves between
+    # the two without renaming tables. Override it when dev and production share
+    # a database and the tables must stay apart.
+    DEV_TABLE_PREFIX="${DEV_TABLE_PREFIX:-$DB_TABLE_PREFIX}"
 
     # Dev reuses one connection account for every site instead of a dedicated
     # user per database, so `bin/dev up` creates a missing database itself when
@@ -194,7 +203,7 @@ print_site_config() {
     echo "  Site URL:     ${SITE_URL}"
     echo "  WP path:      ${WP_PATH}"
     echo "  WP version:   ${WP_VERSION} (${SITE_LOCALE})"
-    echo "  DB:           ${DB_NAME} @ ${DB_HOST}:${DB_PORT} (user ${DB_USER})"
+    echo "  DB:           ${DB_NAME} @ ${DB_HOST}:${DB_PORT} (user ${DB_USER}, prefix ${DB_TABLE_PREFIX})"
     echo "  PHP-FPM:      ${PHP_FPM_SOCK}"
     echo "  Nginx mode:   ${NGINX_MODE}"
     echo "  Nginx conf:   ${NGINX_CONF_FILE}"
