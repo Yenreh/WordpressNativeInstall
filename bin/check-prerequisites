@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# =============================================================================
+# check-prerequisites - Verify (and optionally install) the host stack needed
+# by bin/install-wordpress on Ubuntu 24.04 LTS.
+#
+# Usage:
+#   sudo bash bin/check-prerequisites [--config sites/<domain>.env]
+#                                     [--php-version 8.3] [--nginx-branch stable]
+#                                     [--check-only] [--yes]
+#
+# Installs when missing: nginx (from nginx.org), PHP + WordPress extensions,
+# WP-CLI, base utilities.
+# Only verified, never installed: MariaDB (see the printed instructions).
+#
+# Phase 1 checks everything without touching the system, prints a summary and
+# asks for confirmation; phase 2 installs only what is missing.
+# =============================================================================
+
+# No `set -e` during the check phase on purpose: probing for a missing package
+# legitimately returns a non-zero status.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${REPO_ROOT}/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "${REPO_ROOT}/lib/config.sh"
+
+# --- Options ----------------------------------------------------------------
+CONFIG_ARG=""
+PHP_VERSION="8.3"
+NGINX_BRANCH="stable"          # stable -> 1.30.x | mainline -> 1.31.x+
+MARIADB_MIN_VERSION="11.4"
+CHECK_ONLY=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)       print_usage "$0"; exit 0 ;;
+        -c|--config)     CONFIG_ARG="$2"; shift 2 ;;
+        --php-version)   PHP_VERSION="$2"; shift 2 ;;
+        --nginx-branch)  NGINX_BRANCH="$2"; shift 2 ;;
+        --check-only)    CHECK_ONLY=true; shift ;;
+        -y|--yes)        ASSUME_YES=true; shift ;;
+        *)               die "Unknown option: $1" ;;
+    esac
+done
+
+# A site config only contributes PHP_VERSION here; it is optional.
+if [ -n "$CONFIG_ARG" ]; then
+    SITE_CONFIG_PATH="$(resolve_site_config "$CONFIG_ARG")" || exit 1
+    load_site_config "$SITE_CONFIG_PATH"
+fi
+
+PHP_PKGS=(
+    "php${PHP_VERSION}-fpm"      "php${PHP_VERSION}-mysql"
+    "php${PHP_VERSION}-curl"     "php${PHP_VERSION}-gd"
+    "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-xml"
+    "php${PHP_VERSION}-zip"      "php${PHP_VERSION}-intl"
+    "php${PHP_VERSION}-bcmath"   "php${PHP_VERSION}-imagick"
+    "php${PHP_VERSION}-soap"     "php${PHP_VERSION}-cli"
+)
+BASE_PKGS=(curl wget openssl unzip gnupg2 ca-certificates lsb-release ubuntu-keyring apt-transport-https)
+
+declare -a TO_INSTALL=() CHECK_OK=() CHECK_WARN=() CHECK_ERROR=()
+NEED_NGINX=false NEED_PHP=false NEED_WPCLI=false NEED_UTILITIES=false
+
+mark_ok()      { echo "    ${C_GREEN}[OK]${C_NC}      $1"; CHECK_OK+=("$1"); }
+mark_missing() { echo "    ${C_YELLOW}[MISSING]${C_NC} $1"; TO_INSTALL+=("$1"); }
+mark_warn()    { echo "    ${C_YELLOW}[WARN]${C_NC}    $1"; CHECK_WARN+=("$1"); }
+mark_error()   { echo "    ${C_RED}[ERROR]${C_NC}   $1"; CHECK_ERROR+=("$1"); }
+mark_info()    { echo "    ${C_BLUE}[INFO]${C_NC}    $1"; }
+
+# =============================================================================
+# Phase 1: checks
+# =============================================================================
+
+check_os() {
+    section "Operating system"
+    [ -f /etc/os-release ] || { mark_error "Cannot determine the operating system."; exit 1; }
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    [ "$ID" = "ubuntu" ] || { mark_error "This script targets Ubuntu. Detected: $ID"; exit 1; }
+    if [ "${VERSION_CODENAME:-}" != "noble" ]; then
+        mark_warn "Ubuntu ${VERSION_ID} (${VERSION_CODENAME:-unknown}) — designed for 24.04 (noble). May still work."
+    else
+        mark_ok "Ubuntu 24.04 LTS (noble)"
+    fi
+}
+
+check_utilities() {
+    section "Base utilities"
+    local pkg
+    for pkg in "${BASE_PKGS[@]}"; do
+        if dpkg -s "$pkg" &>/dev/null; then mark_ok "$pkg"; else mark_missing "$pkg"; NEED_UTILITIES=true; fi
+    done
+}
+
+check_nginx() {
+    section "Nginx (target: ${NGINX_BRANCH} branch from nginx.org)"
+    if ! command -v nginx &>/dev/null; then
+        mark_missing "nginx is not installed"
+        NEED_NGINX=true
+        return
+    fi
+
+    local version
+    version=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)
+    if [ "$NGINX_BRANCH" = "stable" ] && [[ "$version" != 1.30.* ]]; then
+        mark_warn "nginx ${version} installed — the stable nginx.org branch is 1.30.x"
+    else
+        mark_ok "nginx ${version}"
+    fi
+
+    if systemctl is-active --quiet nginx; then
+        mark_ok "nginx service is active"
+    else
+        mark_warn "nginx is installed but the service is not running"
+    fi
+}
+
+check_php() {
+    section "PHP ${PHP_VERSION} + WordPress extensions"
+    local pkg
+    for pkg in "${PHP_PKGS[@]}"; do
+        if dpkg -s "$pkg" &>/dev/null; then mark_ok "$pkg"; else mark_missing "$pkg"; NEED_PHP=true; fi
+    done
+
+    [ "$NEED_PHP" = true ] && return
+
+    local service="php${PHP_VERSION}-fpm"
+    if systemctl is-active --quiet "$service"; then
+        mark_ok "${service} service is active"
+    else
+        mark_warn "${service} is installed but not running"
+        NEED_PHP=true
+    fi
+
+    local sock="/run/php/php${PHP_VERSION}-fpm.sock"
+    if [ -S "$sock" ]; then mark_ok "FPM socket: $sock"; else mark_warn "FPM socket not found: $sock"; fi
+}
+
+check_mariadb() {
+    section "MariaDB (verified only — never installed by this script)"
+
+    if ! command -v mariadb &>/dev/null && ! command -v mysql &>/dev/null; then
+        mark_error "MariaDB is not installed"
+        mark_info "Install it with:"
+        echo ""
+        echo "      curl -fsSL https://r.mariadb.com/downloads/mariadb_repo_setup \\"
+        echo "        | sudo bash -s -- --mariadb-server-version=mariadb-${MARIADB_MIN_VERSION}"
+        echo "      sudo apt-get update"
+        echo "      sudo apt-get install -y mariadb-server mariadb-client"
+        echo "      sudo systemctl enable --now mariadb"
+        echo ""
+        return
+    fi
+
+    # Known `mariadb --version` shapes:
+    #   "mariadb from 11.4.11-MariaDB, client 15.2 ..."   (>= 11.x)
+    #   "mariadb  Ver 15.1 Distrib 10.x.x-MariaDB, ..."   (<= 10.x)
+    local raw version
+    raw=$( { command -v mariadb &>/dev/null && mariadb --version; } 2>&1 || mysql --version 2>&1 )
+    version=$(echo "$raw" | grep -oP 'from \K[\d.]+' | head -1)
+    [ -z "$version" ] && version=$(echo "$raw" | grep -oP 'Distrib \K[\d.]+' | head -1)
+    [ -z "$version" ] && version=$(echo "$raw" | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1)
+
+    if [ -z "$version" ]; then
+        mark_warn "Could not determine the MariaDB version"
+    else
+        local major minor req_major req_minor
+        major=${version%%.*}; minor=$(echo "$version" | cut -d. -f2)
+        req_major=${MARIADB_MIN_VERSION%%.*}; req_minor=$(echo "$MARIADB_MIN_VERSION" | cut -d. -f2)
+        if [ "$major" -gt "$req_major" ] || { [ "$major" -eq "$req_major" ] && [ "$minor" -ge "$req_minor" ]; }; then
+            mark_ok "MariaDB ${version} (>= ${MARIADB_MIN_VERSION})"
+        else
+            mark_error "MariaDB ${version} — >= ${MARIADB_MIN_VERSION} required"
+            return
+        fi
+    fi
+
+    if systemctl is-active --quiet mariadb; then
+        mark_ok "mariadb service is active"
+    else
+        mark_error "mariadb service is not running — start it with: sudo systemctl start mariadb"
+        return
+    fi
+
+    if db_root -e "SELECT 1;" &>/dev/null; then
+        mark_ok "root socket connectivity verified"
+    else
+        mark_warn "Cannot connect to MariaDB over the root socket"
+        mark_warn "bin/install-wordpress requires a working: sudo mariadb -e 'SELECT 1;'"
+    fi
+}
+
+check_wpcli() {
+    section "WP-CLI"
+    if command -v wp &>/dev/null; then
+        mark_ok "WP-CLI $(wp --info --allow-root 2>/dev/null | grep 'WP-CLI version' | awk '{print $NF}') at $(command -v wp)"
+    else
+        mark_missing "WP-CLI is not installed"
+        NEED_WPCLI=true
+    fi
+}
+
+print_versions() {
+    echo "  ${C_BLUE}Installed versions:${C_NC}"
+    command -v nginx &>/dev/null && echo "    nginx:   $(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)"
+    command -v php   &>/dev/null && echo "    PHP:     $(php -r 'echo PHP_VERSION;')"
+    if command -v mariadb &>/dev/null; then
+        local v
+        v=$(mariadb --version 2>&1 | grep -oP 'from \K[\d.]+' | head -1)
+        [ -z "$v" ] && v=$(mariadb --version 2>&1 | grep -oP '[\d]+\.[\d]+\.[\d]+' | head -1)
+        echo "    MariaDB: $v"
+    fi
+    command -v wp &>/dev/null && echo "    WP-CLI:  $(wp --info --allow-root 2>/dev/null | grep 'WP-CLI version' | awk '{print $NF}')"
+    echo ""
+}
+
+print_summary() {
+    banner "CHECK SUMMARY"
+    echo "  ${C_GREEN}OK:${C_NC}       ${#CHECK_OK[@]} component(s)"
+    echo "  ${C_YELLOW}Missing:${C_NC}  ${#TO_INSTALL[@]} component(s)"
+    echo "  ${C_YELLOW}Warnings:${C_NC} ${#CHECK_WARN[@]}"
+    echo "  ${C_RED}Errors:${C_NC}   ${#CHECK_ERROR[@]} (manual action required)"
+    echo ""
+
+    if [ ${#CHECK_ERROR[@]} -gt 0 ]; then
+        echo "  ${C_RED}${C_BOLD}Errors requiring manual action:${C_NC}"
+        printf '    %s\n' "${CHECK_ERROR[@]}"
+        echo ""
+        die "Resolve the errors above before continuing."
+    fi
+
+    if [ ${#CHECK_WARN[@]} -gt 0 ]; then
+        echo "  ${C_YELLOW}Warnings:${C_NC}"
+        printf '    %s\n' "${CHECK_WARN[@]}"
+        echo ""
+    fi
+
+    if [ ${#TO_INSTALL[@]} -eq 0 ]; then
+        echo "  ${C_GREEN}${C_BOLD}All prerequisites are satisfied.${C_NC}"
+        echo ""
+        print_versions
+        echo "  ${C_GREEN}Next: sudo bash bin/install-wordpress --config sites/<domain>.env${C_NC}"
+        echo ""
+        exit 0
+    fi
+
+    echo "  ${C_YELLOW}${C_BOLD}Components to install:${C_NC}"
+    printf '    + %s\n' "${TO_INSTALL[@]}"
+    echo ""
+    $NEED_NGINX     && echo "    ${C_BLUE}nginx:${C_NC}  nginx.org ${NGINX_BRANCH} repository + GPG verification"
+    $NEED_PHP       && echo "    ${C_BLUE}PHP:${C_NC}    php${PHP_VERSION}-fpm + WordPress extensions"
+    $NEED_WPCLI     && echo "    ${C_BLUE}WP-CLI:${C_NC} downloaded from github.com/wp-cli"
+    $NEED_UTILITIES && echo "    ${C_BLUE}Utils:${C_NC}  ${BASE_PKGS[*]}"
+    echo ""
+}
+
+# =============================================================================
+# Phase 2: installation
+# =============================================================================
+
+install_nginx() {
+    echo ""
+    info "Installing nginx (${NGINX_BRANCH}) from nginx.org..."
+
+    local keyring="/usr/share/keyrings/nginx-archive-keyring.gpg"
+    local sources_file="/etc/apt/sources.list.d/nginx.list"
+    local prefs_file="/etc/apt/preferences.d/99nginx"
+    # Official nginx.org signing key. The keyring may carry extra keys; this one must be there.
+    local expected_fingerprint="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+
+    curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee "$keyring" >/dev/null
+
+    local found
+    found=$(gpg --dry-run --quiet --no-keyring --import --import-options import-show "$keyring" 2>/dev/null \
+        | grep -oP '[0-9A-F]{40}')
+
+    if echo "$found" | grep -q "$expected_fingerprint"; then
+        ok "GPG fingerprint verified: $expected_fingerprint"
+    else
+        err "Official nginx.org GPG fingerprint not found in the downloaded keyring."
+        echo "          Expected: $expected_fingerprint"
+        echo "          Found:    ${found:-<none>}"
+        rm -f "$keyring"
+        die "Aborting for safety."
+    fi
+
+    local repo_path="https://nginx.org/packages/ubuntu"
+    [ "$NGINX_BRANCH" = "mainline" ] && repo_path="https://nginx.org/packages/mainline/ubuntu"
+    echo "deb [signed-by=${keyring}] ${repo_path} $(lsb_release -cs) nginx" | tee "$sources_file" >/dev/null
+
+    # Pin nginx.org above the Ubuntu packages.
+    printf "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" \
+        | tee "$prefs_file" >/dev/null
+
+    apt-get update -qq
+    apt-get install -y nginx
+    ok "nginx $(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1) installed"
+
+    systemctl enable nginx --quiet
+    systemctl start nginx
+    ok "nginx enabled and started"
+}
+
+install_php() {
+    echo ""
+    info "Installing PHP ${PHP_VERSION} + WordPress extensions..."
+
+    local missing=() pkg
+    for pkg in "${PHP_PKGS[@]}"; do
+        dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+    done
+    [ ${#missing[@]} -gt 0 ] && apt-get install -y -qq "${missing[@]}"
+
+    local service="php${PHP_VERSION}-fpm"
+    systemctl enable "$service" --quiet
+    systemctl start "$service"
+    ok "${service} enabled and started"
+
+    sleep 1
+    local sock="/run/php/php${PHP_VERSION}-fpm.sock"
+    if [ -S "$sock" ]; then ok "FPM socket available: $sock"; else warn "FPM socket not found at $sock"; fi
+}
+
+install_wpcli() {
+    echo ""
+    info "Installing WP-CLI..."
+    local url="https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
+    local tmp="/tmp/wp-cli.phar"
+
+    curl -fsSL "$url" -o "$tmp"
+    if ! php "$tmp" --info --allow-root &>/dev/null; then
+        rm -f "$tmp"
+        die "The downloaded WP-CLI phar is not valid. Check connectivity and retry."
+    fi
+    chmod +x "$tmp"
+    mv "$tmp" /usr/local/bin/wp
+    ok "WP-CLI $(wp --info --allow-root 2>/dev/null | grep 'WP-CLI version' | awk '{print $NF}') installed"
+}
+
+do_install() {
+    set -e   # from here on, abort on any error
+    banner "Phase 2: installing missing components"
+
+    info "Refreshing package lists..."
+    apt-get update -qq
+
+    if $NEED_UTILITIES; then
+        echo ""
+        info "Installing base utilities..."
+        local missing=() pkg
+        for pkg in "${BASE_PKGS[@]}"; do
+            dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+        done
+        [ ${#missing[@]} -gt 0 ] && apt-get install -y -qq "${missing[@]}"
+        ok "Base utilities ready"
+    fi
+
+    $NEED_NGINX && install_nginx
+    $NEED_PHP   && install_php
+    $NEED_WPCLI && install_wpcli   # requires PHP
+    return 0
+}
+
+# =============================================================================
+main() {
+    require_root
+    banner "WordPress prerequisites checker" "Ubuntu 24.04 LTS | PHP ${PHP_VERSION} | nginx (${NGINX_BRANCH})"
+
+    check_os
+    check_utilities
+    check_nginx
+    check_php
+    check_mariadb
+    check_wpcli
+
+    print_summary   # exits when nothing is missing
+
+    if [ "$CHECK_ONLY" = true ]; then
+        info "--check-only: nothing was installed."
+        exit 1
+    fi
+
+    confirm "Install the missing components now?" || { info "Cancelled."; exit 0; }
+    do_install
+
+    banner "PREREQUISITES SATISFIED"
+    print_versions
+    echo "  ${C_GREEN}Next: sudo bash bin/install-wordpress --config sites/<domain>.env${C_NC}"
+    echo ""
+}
+
+main "$@"

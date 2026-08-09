@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# =============================================================================
+# console - Day-to-day operations on an installed site.
+#
+# Usage:
+#   bash bin/console [--config sites/<domain>.env] <command> [args]
+#
+# Commands:
+#   info          Print the resolved configuration (no secrets)
+#   status        Health check: WordPress, PHP-FPM, nginx, database, certificate
+#   permissions   Reapply ownership and file modes on the document root (root)
+#   nginx         Re-render and install the nginx site config (root)
+#   reload        Validate nginx and reload nginx + PHP-FPM (root)
+#   ssl-renew     Regenerate the self-signed certificate (root)
+#   db-dump [f]   Dump the database to backups/ (or to the given file)
+#   wp <args>     Run WP-CLI against this site, e.g. `console wp plugin list`
+# =============================================================================
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${REPO_ROOT}/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "${REPO_ROOT}/lib/config.sh"
+
+usage() { print_usage "$0"; }
+
+CONFIG_ARG=""
+QUIET=false
+ARGS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)   usage; exit 0 ;;
+        -c|--config) CONFIG_ARG="$2"; shift 2 ;;
+        -y|--yes)    ASSUME_YES=true; shift ;;
+        --quiet)     QUIET=true; shift ;;
+        --)          shift; ARGS+=("$@"); break ;;
+        *)           ARGS+=("$1"); shift ;;
+    esac
+done
+
+[ ${#ARGS[@]} -gt 0 ] || { usage; exit 1; }
+COMMAND="${ARGS[0]}"
+ARGS=("${ARGS[@]:1}")
+
+# Two steps on purpose: an exit inside a command substitution would not
+# propagate, and the ambiguity error would be swallowed.
+SITE_CONFIG_PATH="$(resolve_site_config "$CONFIG_ARG")" || exit 1
+load_site_config "$SITE_CONFIG_PATH"
+
+# -----------------------------------------------------------------------------
+cmd_info() {
+    banner "Site configuration" "${SITE_DOMAIN}"
+    print_site_config
+    echo ""
+}
+
+cmd_status() {
+    banner "Site status" "${SITE_DOMAIN}"
+
+    section "WordPress"
+    if [ -f "${WP_PATH}/wp-load.php" ]; then
+        ok "Core files present at ${WP_PATH}"
+        local version
+        version=$(wp core version --path="$WP_PATH" --allow-root 2>/dev/null || echo "unknown")
+        ok "Version ${version}"
+        if wp core is-installed --path="$WP_PATH" --allow-root &>/dev/null; then
+            ok "Installed — home: $(wp option get home --path="$WP_PATH" --allow-root 2>/dev/null)"
+        else
+            warn "Core files exist but WordPress is not installed"
+        fi
+        ok "Disk usage: $(du -sh "$WP_PATH" 2>/dev/null | awk '{print $1}')"
+    else
+        err "No WordPress found at ${WP_PATH}"
+    fi
+
+    section "Services"
+    systemctl is-active --quiet "$PHP_FPM_SERVICE" && ok "${PHP_FPM_SERVICE} active" || err "${PHP_FPM_SERVICE} inactive"
+    [ -S "$PHP_FPM_SOCK" ] && ok "socket ${PHP_FPM_SOCK}" || err "socket missing: ${PHP_FPM_SOCK}"
+    systemctl is-active --quiet nginx && ok "nginx active" || err "nginx inactive"
+    systemctl is-active --quiet mariadb && ok "mariadb active" || err "mariadb inactive"
+
+    section "nginx site"
+    if [ -f "$NGINX_CONF_FILE" ]; then
+        ok "Config: ${NGINX_CONF_FILE}"
+        [ -n "$NGINX_ENABLED_LINK" ] && { [ -L "$NGINX_ENABLED_LINK" ] && ok "Enabled: ${NGINX_ENABLED_LINK}" || warn "Symlink missing: ${NGINX_ENABLED_LINK}"; }
+    else
+        err "Config not found: ${NGINX_CONF_FILE}"
+    fi
+
+    section "Database"
+    if db_root -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" -e "USE \`${DB_NAME}\`;" &>/dev/null; then
+        local tables
+        tables=$(db_root -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" -sN \
+            -e "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='${DB_NAME}';" 2>/dev/null)
+        ok "Connected to ${DB_NAME} as ${DB_USER} (${tables} tables)"
+    else
+        err "Cannot connect to ${DB_NAME} as ${DB_USER}@${DB_HOST}:${DB_PORT}"
+    fi
+
+    section "TLS certificate"
+    if [ -f "$SSL_CERT" ]; then
+        local expiry
+        expiry=$(openssl x509 -in "$SSL_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)
+        if openssl x509 -in "$SSL_CERT" -noout -checkend 0 >/dev/null 2>&1; then
+            ok "Valid until ${expiry}"
+        else
+            err "EXPIRED on ${expiry} — run: sudo bash bin/console ssl-renew"
+        fi
+    else
+        err "Certificate not found: ${SSL_CERT}"
+    fi
+    echo ""
+}
+
+cmd_permissions() {
+    require_root
+    [ -d "$WP_PATH" ] || die "Document root not found: ${WP_PATH}"
+
+    [ "$QUIET" = true ] || info "Applying permissions on ${WP_PATH}..."
+
+    chown -R "${WEB_USER}:${WEB_GROUP}" "$WP_PATH"
+    find "$WP_PATH" -type d -exec chmod 755 {} +
+    find "$WP_PATH" -type f -exec chmod 644 {} +
+    # wp-content must stay group-writable for plugin/theme installs and uploads.
+    [ -d "${WP_PATH}/wp-content" ] && chmod -R 775 "${WP_PATH}/wp-content"
+    [ -f "${WP_PATH}/wp-config.php" ] && chmod 640 "${WP_PATH}/wp-config.php"
+
+    [ "$QUIET" = true ] || ok "Permissions applied (dirs 755, files 644, wp-content 775, wp-config.php 640)"
+}
+
+cmd_nginx() {
+    require_root
+    exec bash "${REPO_ROOT}/bin/install-wordpress" --config "$SITE_CONFIG_FILE" --nginx-only
+}
+
+cmd_reload() {
+    require_root
+    nginx -t || die "nginx configuration is invalid; nothing was reloaded."
+    systemctl reload nginx && ok "nginx reloaded"
+    systemctl reload "$PHP_FPM_SERVICE" && ok "${PHP_FPM_SERVICE} reloaded"
+}
+
+cmd_ssl_renew() {
+    require_root
+    mkdir -p "$SSL_DIR"
+
+    if [ -f "$SSL_CERT" ]; then
+        confirm "Replace the existing certificate at ${SSL_CERT}?" || { info "Certificate kept."; return 0; }
+    fi
+
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$SSL_KEY" -out "$SSL_CERT" \
+        -subj "/CN=${SITE_DOMAIN}" \
+        -addext "subjectAltName=DNS:${SITE_DOMAIN}" 2>/dev/null
+
+    chmod 600 "$SSL_KEY"
+    chmod 644 "$SSL_CERT"
+    ok "Self-signed certificate regenerated (valid 365 days)"
+    info "Apply it with: sudo bash bin/console --config ${SITE_CONFIG_FILE} reload"
+}
+
+cmd_db_dump() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        mkdir -p "${REPO_ROOT}/backups"
+        target="${REPO_ROOT}/backups/${DB_NAME}-$(date '+%Y%m%d-%H%M%S').sql"
+    fi
+
+    local dump_cmd="mysqldump"
+    command -v mariadb-dump >/dev/null 2>&1 && dump_cmd="mariadb-dump"
+
+    umask 077
+    "$dump_cmd" -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" \
+        --single-transaction --quick --default-character-set=utf8mb4 \
+        "${DB_NAME}" > "$target"
+
+    ok "Dump written: ${target} ($(du -h "$target" | awk '{print $1}'))"
+    warn "The dump contains site data. Keep it out of the repository (backups/ is gitignored)."
+}
+
+cmd_wp() {
+    [ $# -gt 0 ] || die "Usage: console wp <wp-cli arguments>"
+    wp "$@" --path="$WP_PATH" --allow-root
+}
+
+# -----------------------------------------------------------------------------
+case "$COMMAND" in
+    info)        cmd_info ;;
+    status)      cmd_status ;;
+    permissions) cmd_permissions ;;
+    nginx)       cmd_nginx ;;
+    reload)      cmd_reload ;;
+    ssl-renew)   cmd_ssl_renew ;;
+    db-dump)     cmd_db_dump "${ARGS[@]:-}" ;;
+    wp)          cmd_wp "${ARGS[@]}" ;;
+    *)           err "Unknown command: ${COMMAND}"; echo ""; usage; exit 1 ;;
+esac

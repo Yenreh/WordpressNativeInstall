@@ -1,4 +1,16 @@
 #!/bin/bash
+# =============================================================================
+# LEGACY REFERENCE — NOT part of the supported workflow of this repository.
+#
+# Runs WordPress as an FPM container behind nginx on the host. It is kept only
+# as a starting point for Docker-based deployments; it does not read the site
+# config files under sites/ and it is not maintained alongside bin/*.
+#
+# For a maintained Docker setup use the General-Wordpress-Site repository.
+# For a host (non-Docker) install use: bin/new-site + bin/install-wordpress.
+#
+# All credentials below are placeholders. Never commit real ones.
+# =============================================================================
 
 # ==========================
 # CONFIGURATION

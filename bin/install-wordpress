@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# =============================================================================
+# install-wordpress - Provision a WordPress site on the host (no Docker).
+#
+# Stack: WordPress + WP-CLI, PHP-FPM over a unix socket, MariaDB, nginx,
+# self-signed TLS (replaceable by Let's Encrypt afterwards).
+#
+# Usage:
+#   sudo bash bin/install-wordpress --config sites/<domain>.env [--yes]
+#                                   [--skip-nginx] [--skip-ssl]
+#
+# Every value comes from the site config file; nothing is hardcoded here.
+# Create the config first with: bin/new-site <domain>
+# Verify the host stack first with: sudo bash bin/check-prerequisites
+# =============================================================================
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${REPO_ROOT}/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "${REPO_ROOT}/lib/config.sh"
+
+NGINX_TEMPLATE="${REPO_ROOT}/nginx/site.conf.tpl"
+
+CONFIG_ARG=""
+SKIP_NGINX=false
+SKIP_SSL=false
+NGINX_ONLY=false      # used by `console nginx` to re-render the site config
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)    print_usage "$0"; exit 0 ;;
+        -c|--config)  CONFIG_ARG="$2"; shift 2 ;;
+        -y|--yes)     ASSUME_YES=true; shift ;;
+        --skip-nginx) SKIP_NGINX=true; shift ;;
+        --skip-ssl)   SKIP_SSL=true; shift ;;
+        --nginx-only) NGINX_ONLY=true; shift ;;
+        *)            die "Unknown option: $1" ;;
+    esac
+done
+
+# -----------------------------------------------------------------------------
+verify_prerequisites() {
+    step "Verifying prerequisites"
+    local missing=0
+
+    command -v nginx >/dev/null 2>&1 \
+        && ok "nginx $(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)" \
+        || { err "nginx not found"; missing=$((missing + 1)); }
+
+    command -v php >/dev/null 2>&1 \
+        && ok "PHP $(php -r 'echo PHP_VERSION;')" \
+        || { err "php not found"; missing=$((missing + 1)); }
+
+    if [ ! -S "$PHP_FPM_SOCK" ]; then
+        warn "PHP-FPM socket missing, trying to start ${PHP_FPM_SERVICE}..."
+        systemctl start "$PHP_FPM_SERVICE" 2>/dev/null || true
+        sleep 1
+    fi
+    [ -S "$PHP_FPM_SOCK" ] \
+        && ok "PHP-FPM socket: $PHP_FPM_SOCK" \
+        || { err "PHP-FPM socket not available: $PHP_FPM_SOCK"; missing=$((missing + 1)); }
+
+    command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1 \
+        && ok "MariaDB client available" \
+        || { err "mariadb/mysql client not found"; missing=$((missing + 1)); }
+
+    systemctl is-active --quiet mariadb \
+        && ok "mariadb service is active" \
+        || { err "mariadb service is not running"; missing=$((missing + 1)); }
+
+    command -v wp >/dev/null 2>&1 \
+        && ok "WP-CLI $(wp --info --allow-root 2>/dev/null | grep 'WP-CLI version' | awk '{print $NF}')" \
+        || { err "wp-cli not found"; missing=$((missing + 1)); }
+
+    [ "$missing" -eq 0 ] || die "$missing missing prerequisite(s). Run: sudo bash bin/check-prerequisites"
+    ok "All prerequisites satisfied"
+}
+
+# -----------------------------------------------------------------------------
+prepare_install_path() {
+    step "Preparing install path: ${WP_PATH}"
+
+    if [ -d "$WP_PATH" ] && [ -n "$(ls -A "$WP_PATH" 2>/dev/null)" ]; then
+        warn "${WP_PATH} already exists and is not empty."
+        confirm "Continue and overwrite its contents?" || { info "Cancelled."; exit 0; }
+    fi
+
+    mkdir -p "$WP_PATH"
+    ok "Directory ready: ${WP_PATH}"
+}
+
+# -----------------------------------------------------------------------------
+setup_database() {
+    step "Configuring the MariaDB database"
+
+    db_root -e "SELECT 1;" &>/dev/null \
+        || die "Cannot reach MariaDB over the root socket. Check: sudo mariadb -e 'SELECT 1;'"
+
+    local existing
+    existing=$(db_root -sN -e \
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';" 2>/dev/null || echo "")
+
+    if [ -n "$existing" ]; then
+        warn "Database '${DB_NAME}' already exists."
+        if confirm "Drop and recreate it? THIS DELETES ALL ITS DATA."; then
+            db_root -e "DROP DATABASE \`${DB_NAME}\`;"
+            info "Database '${DB_NAME}' dropped."
+        else
+            info "Reusing the existing database '${DB_NAME}'."
+        fi
+    fi
+
+    db_root -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    ok "Database '${DB_NAME}' ready (utf8mb4)"
+
+    # Recreate the dedicated user so the password always matches the config.
+    db_root -e "DROP USER IF EXISTS '${DB_USER}'@'${DB_HOST}';" 2>/dev/null || true
+    db_root -e "DROP USER IF EXISTS '${DB_USER}'@'localhost';" 2>/dev/null || true
+
+    db_root -e "CREATE USER '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASSWORD}';"
+    db_root -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}';"
+
+    # WordPress may resolve the host as 'localhost' (socket) instead of 127.0.0.1.
+    if [ "$DB_HOST" != "localhost" ]; then
+        db_root -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
+        db_root -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+    fi
+
+    db_root -e "FLUSH PRIVILEGES;"
+    ok "User '${DB_USER}'@'${DB_HOST}' granted on '${DB_NAME}'"
+
+    if db_root -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" -e "USE \`${DB_NAME}\`;" &>/dev/null; then
+        ok "Connectivity for '${DB_USER}' verified"
+    else
+        warn "Could not verify connectivity for '${DB_USER}' on ${DB_HOST}:${DB_PORT}"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+download_wordpress() {
+    step "Downloading WordPress (${WP_VERSION})"
+
+    local version_flag=()
+    [ "$WP_VERSION" != "latest" ] && version_flag=(--version="$WP_VERSION")
+
+    wp core download \
+        --path="$WP_PATH" \
+        --locale="$SITE_LOCALE" \
+        "${version_flag[@]}" \
+        --allow-root \
+        --force
+
+    ok "WordPress $(wp core version --path="$WP_PATH" --allow-root 2>/dev/null) downloaded to ${WP_PATH}"
+}
+
+# -----------------------------------------------------------------------------
+create_wp_config() {
+    step "Generating wp-config.php"
+
+    rm -f "${WP_PATH}/wp-config.php"
+
+    wp config create \
+        --path="$WP_PATH" \
+        --dbname="$DB_NAME" \
+        --dbuser="$DB_USER" \
+        --dbpass="$DB_PASSWORD" \
+        --dbhost="${DB_HOST}:${DB_PORT}" \
+        --dbcharset="utf8mb4" \
+        --dbcollate="utf8mb4_unicode_ci" \
+        --locale="$SITE_LOCALE" \
+        --allow-root
+
+    wp config set WP_DEBUG false --raw --path="$WP_PATH" --allow-root
+    wp config set WP_DEBUG_LOG false --raw --path="$WP_PATH" --allow-root
+    wp config set DISALLOW_FILE_EDIT true --raw --path="$WP_PATH" --allow-root
+    wp config set FS_METHOD "direct" --path="$WP_PATH" --allow-root
+
+    ok "wp-config.php generated (WP_DEBUG=false, DISALLOW_FILE_EDIT=true, FS_METHOD=direct)"
+}
+
+# -----------------------------------------------------------------------------
+install_core() {
+    step "Installing WordPress core"
+
+    if wp core is-installed --path="$WP_PATH" --allow-root &>/dev/null; then
+        warn "WordPress is already installed at ${WP_PATH}."
+        if ! confirm "Run the installer again? This resets the database content."; then
+            info "Keeping the existing installation."
+            return 0
+        fi
+    fi
+
+    wp core install \
+        --path="$WP_PATH" \
+        --url="$SITE_URL" \
+        --title="$SITE_TITLE" \
+        --admin_user="$WP_ADMIN_USER" \
+        --admin_password="$WP_ADMIN_PASSWORD" \
+        --admin_email="$WP_ADMIN_EMAIL" \
+        --skip-email \
+        --allow-root
+
+    ok "WordPress installed at ${SITE_URL}"
+
+    info "Applying post-install defaults..."
+    # Sample post and sample page shipped by the installer.
+    wp post delete 1 2 --force --path="$WP_PATH" --allow-root 2>/dev/null || true
+    wp rewrite structure '/%postname%/' --path="$WP_PATH" --allow-root 2>/dev/null || true
+    wp rewrite flush --path="$WP_PATH" --allow-root 2>/dev/null || true
+    ok "Permalinks set to /%postname%/, sample content removed"
+}
+
+# -----------------------------------------------------------------------------
+set_permissions() {
+    step "Setting file permissions"
+    bash "${REPO_ROOT}/bin/console" --config "$SITE_CONFIG_FILE" permissions --quiet
+    ok "Ownership ${WEB_USER}:${WEB_GROUP} | dirs 755 | files 644 | wp-content 775 | wp-config.php 640"
+}
+
+# -----------------------------------------------------------------------------
+setup_ssl() {
+    step "Configuring TLS certificate"
+
+    if [ "$SKIP_SSL" = true ]; then
+        info "--skip-ssl: leaving ${SSL_DIR} untouched"
+        return 0
+    fi
+
+    mkdir -p "$SSL_DIR"
+
+    if [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ]; then
+        ok "Certificate already present: ${SSL_CERT}"
+        return 0
+    fi
+
+    info "Generating a self-signed certificate for ${SITE_DOMAIN}..."
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$SSL_KEY" \
+        -out "$SSL_CERT" \
+        -subj "/CN=${SITE_DOMAIN}" \
+        -addext "subjectAltName=DNS:${SITE_DOMAIN}" 2>/dev/null
+
+    chmod 600 "$SSL_KEY"
+    chmod 644 "$SSL_CERT"
+    ok "Self-signed certificate generated: ${SSL_CERT} (valid 365 days)"
+}
+
+# -----------------------------------------------------------------------------
+# The standalone `http2 on;` directive was introduced in nginx 1.25.1.
+nginx_supports_http2_directive() {
+    local version major minor patch
+    version=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)
+    [ -n "$version" ] || return 1
+    major=${version%%.*}
+    minor=$(echo "$version" | cut -d. -f2)
+    patch=$(echo "$version" | cut -d. -f3)
+    patch=${patch:-0}
+
+    [ "$major" -gt 1 ] && return 0
+    [ "$major" -lt 1 ] && return 1
+    [ "$minor" -gt 25 ] && return 0
+    [ "$minor" -lt 25 ] && return 1
+    [ "$patch" -ge 1 ]
+}
+
+setup_nginx() {
+    step "Configuring nginx (mode: ${NGINX_MODE})"
+
+    if [ "$SKIP_NGINX" = true ]; then
+        info "--skip-nginx: leaving the nginx configuration untouched"
+        return 0
+    fi
+
+    # Drop any config left behind by the other mode.
+    if [ "$NGINX_MODE" = "nginxorg" ]; then
+        mkdir -p /etc/nginx/conf.d
+        rm -f "/etc/nginx/sites-enabled/${NGINX_SITE_NAME}" "/etc/nginx/sites-available/${NGINX_SITE_NAME}"
+    else
+        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+        rm -f "/etc/nginx/conf.d/${NGINX_SITE_NAME}.conf"
+    fi
+
+    if [ -f "$NGINX_CONF_FILE" ]; then
+        warn "A site config already exists at ${NGINX_CONF_FILE}."
+        if ! confirm "Overwrite it?"; then
+            info "Keeping the existing nginx config."
+            return 0
+        fi
+        cp -a "$NGINX_CONF_FILE" "${NGINX_CONF_FILE}.bak"
+        info "Backup saved: ${NGINX_CONF_FILE}.bak"
+    fi
+
+    # `http2 on;` exists since nginx 1.25.1; older builds need `listen ... http2`.
+    local listen_443
+    if nginx_supports_http2_directive; then
+        listen_443=$'listen 443 ssl;\n    listen [::]:443 ssl;\n    http2 on;'
+    else
+        listen_443=$'listen 443 ssl http2;\n    listen [::]:443 ssl http2;'
+    fi
+
+    render_template "$NGINX_TEMPLATE" \
+        "LISTEN_443=${listen_443}" \
+        "DOMAIN=${SITE_DOMAIN}" \
+        "DOCROOT=${WP_PATH}" \
+        "PHP_FPM_SOCK=${PHP_FPM_SOCK}" \
+        "SSL_CERT=${SSL_CERT}" \
+        "SSL_KEY=${SSL_KEY}" \
+        "ACCESS_LOG=${ACCESS_LOG}" \
+        "ERROR_LOG=${ERROR_LOG}" \
+        "CLIENT_MAX_BODY_SIZE=${CLIENT_MAX_BODY_SIZE}" \
+        > "$NGINX_CONF_FILE"
+    ok "Site config written: ${NGINX_CONF_FILE}"
+
+    if [ -n "$NGINX_ENABLED_LINK" ]; then
+        ln -sf "$NGINX_CONF_FILE" "$NGINX_ENABLED_LINK"
+        ok "Site enabled: ${NGINX_ENABLED_LINK}"
+    fi
+
+    # nginx.org packages run the workers as 'nginx', but the PHP-FPM socket and
+    # the WordPress files belong to www-data.
+    if [ "$NGINX_MODE" = "nginxorg" ]; then
+        if grep -qE '^user +nginx;' /etc/nginx/nginx.conf; then
+            sed -i -E "s/^user +nginx;/user ${WEB_USER};/" /etc/nginx/nginx.conf
+            ok "nginx worker user switched to ${WEB_USER} (PHP-FPM socket access)"
+        else
+            info "nginx user directive: $(grep -E '^user' /etc/nginx/nginx.conf || echo 'not set')"
+        fi
+    fi
+
+    if nginx -t 2>/dev/null; then
+        ok "nginx configuration is valid"
+    else
+        echo ""
+        nginx -t || true
+        die "Invalid nginx configuration. Review ${NGINX_CONF_FILE}"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+reload_services() {
+    step "Reloading services"
+    systemctl reload "$PHP_FPM_SERVICE" && ok "${PHP_FPM_SERVICE} reloaded"
+    if [ "$SKIP_NGINX" != true ]; then
+        systemctl reload nginx && ok "nginx reloaded"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+print_summary() {
+    local version
+    version=$(wp core version --path="$WP_PATH" --allow-root 2>/dev/null || echo "installed")
+
+    echo ""
+    echo "${C_GREEN}${C_BOLD}================================================================${C_NC}"
+    echo "${C_GREEN}${C_BOLD}  INSTALLATION COMPLETE${C_NC}"
+    echo "${C_GREEN}${C_BOLD}================================================================${C_NC}"
+    echo ""
+    echo "  WordPress ${version} is installed."
+    echo ""
+    echo "  ${C_BLUE}Access${C_NC}"
+    echo "    Site:   ${SITE_URL}"
+    echo "    Admin:  ${SITE_URL}/wp-admin  (user: ${WP_ADMIN_USER})"
+    echo ""
+    echo "  ${C_BLUE}Credentials${C_NC}"
+    echo "    Admin and database passwords are stored in: ${SITE_CONFIG_FILE}"
+    echo "    They are intentionally not printed here."
+    echo ""
+    echo "  ${C_BLUE}Paths${C_NC}"
+    echo "    WordPress:  ${WP_PATH}"
+    echo "    wp-config:  ${WP_PATH}/wp-config.php (640)"
+    echo "    TLS certs:  ${SSL_DIR}"
+    echo "    nginx conf: ${NGINX_CONF_FILE}"
+    echo "    nginx logs: ${ACCESS_LOG}"
+    echo "                ${ERROR_LOG}"
+    echo ""
+    echo "  ${C_YELLOW}Next steps${C_NC}"
+    echo "    - The certificate is SELF-SIGNED. For production use Let's Encrypt:"
+    echo "        sudo apt install certbot python3-certbot-nginx"
+    echo "        sudo certbot --nginx -d ${SITE_DOMAIN}"
+    echo "    - Day-to-day operations: bash bin/console --config ${SITE_CONFIG_FILE} <command>"
+    echo ""
+    echo "${C_GREEN}${C_BOLD}================================================================${C_NC}"
+    echo ""
+}
+
+# =============================================================================
+main() {
+    require_root
+    local config_path
+    config_path="$(resolve_site_config "$CONFIG_ARG")" || exit 1
+    load_site_config "$config_path"
+
+    if [ "$NGINX_ONLY" = true ]; then
+        banner "Re-rendering the nginx site config" "${SITE_DOMAIN}"
+        setup_nginx
+        reload_services
+        exit 0
+    fi
+
+    banner "WordPress installer (host stack, no Docker)" \
+           "PHP ${PHP_VERSION} | MariaDB | nginx (${NGINX_MODE})"
+    print_site_config
+    echo ""
+    confirm "Proceed with this configuration?" || { info "Cancelled."; exit 0; }
+
+    verify_prerequisites
+    prepare_install_path
+    setup_database
+    download_wordpress
+    create_wp_config
+    install_core
+    set_permissions
+    setup_ssl
+    setup_nginx
+    reload_services
+    print_summary
+}
+
+main "$@"
