@@ -5,7 +5,8 @@
 # Usage:
 #   bin/new-site <domain> [--title "Site title"] [--email admin@domain]
 #                         [--locale es_ES] [--path /apps/wordpress/<d>/html]
-#                         [--nginx-mode nginxorg|ubuntu] [--force]
+#                         [--nginx-mode nginxorg|ubuntu] [--dev-port 8080]
+#                         [--force]
 #
 # Writes sites/<domain>.env with mode 600 and freshly generated passwords.
 # The sites/ directory is gitignored: credentials never reach the repository.
@@ -25,6 +26,7 @@ LOCALE="en_US"
 WP_PATH_ARG=""
 NGINX_MODE_ARG="nginxorg"
 PHP_VERSION_ARG="8.3"
+DEV_PORT_ARG=""
 FORCE=false
 
 while [ $# -gt 0 ]; do
@@ -36,6 +38,7 @@ while [ $# -gt 0 ]; do
         --path)        WP_PATH_ARG="$2"; shift 2 ;;
         --nginx-mode)  NGINX_MODE_ARG="$2"; shift 2 ;;
         --php-version) PHP_VERSION_ARG="$2"; shift 2 ;;
+        --dev-port)    DEV_PORT_ARG="$2"; shift 2 ;;
         --force)       FORCE=true; shift ;;
         -*)            die "Unknown option: $1" ;;
         *)             [ -z "$DOMAIN" ] && DOMAIN="$1" || die "Unexpected argument: $1"; shift ;;
@@ -63,6 +66,18 @@ DB_NAME="${DB_NAME:0:60}"
 DB_USER="${DB_USER:0:30}"
 
 TARGET="${REPO_ROOT}/sites/${DOMAIN}.env"
+
+# Pick a dev port that no other site config already claims.
+pick_dev_port() {
+    local port="${DEV_PORT_ARG:-8080}"
+    local used f
+    used="$(grep -hoP '^\s*DEV_HTTP_PORT="?\K[0-9]+' "${REPO_ROOT}"/sites/*.env 2>/dev/null || true)"
+    while echo "$used" | grep -qx "$port"; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+DEV_PORT="$(pick_dev_port)"
 
 if [ -f "$TARGET" ] && [ "$FORCE" != true ]; then
     die "Config already exists: ${TARGET} (use --force to overwrite)"
@@ -108,6 +123,13 @@ DB_PASSWORD="${DB_PASSWORD}"
 PHP_VERSION="${PHP_VERSION_ARG}"
 NGINX_MODE="${NGINX_MODE_ARG}"
 
+# --- Dev stack (bin/dev, Docker; the database stays external) ---
+DEV_HTTP_PORT="${DEV_PORT}"
+# DEV_DB_HOST="host.docker.internal"   # derived from DB_HOST when unset
+# DEV_TABLE_PREFIX="wpdev_"            # only if dev and prod share a DB server
+# DEV_PLUGIN_DIRS="/abs/path/to/plugin"
+# DEV_THEME_DIRS="/abs/path/to/theme"
+
 # --- Optional overrides (see config/site.env.example) ---
 # NGINX_SITE_NAME="${DOMAIN//./-}"
 # CLIENT_MAX_BODY_SIZE="64M"
@@ -119,7 +141,12 @@ ok "File: ${TARGET} (mode 600, gitignored)"
 ok "Admin user: wp_admin — password generated (24 chars)"
 ok "Database:   ${DB_NAME} / ${DB_USER} — password generated (24 chars)"
 echo ""
-info "Review the file, then run:"
+ok "Dev port:   ${DEV_PORT} (http://localhost:${DEV_PORT})"
+echo ""
+info "Review the file, then either provision the host stack:"
 echo "    sudo bash bin/check-prerequisites --config ${TARGET}"
 echo "    sudo bash bin/install-wordpress   --config ${TARGET}"
+echo ""
+info "or run it locally in Docker (no PHP needed, external database):"
+echo "    bash bin/dev --config ${TARGET} up"
 echo ""

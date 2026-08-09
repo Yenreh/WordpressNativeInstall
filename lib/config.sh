@@ -129,6 +129,51 @@ derive_site_config() {
     CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-64M}"
     WEB_USER="${WEB_USER:-www-data}"
     WEB_GROUP="${WEB_GROUP:-www-data}"
+
+    derive_dev_config
+}
+
+# Values used only by bin/dev (the Docker development stack). Every one of them
+# is optional in the config file: sensible defaults are derived here.
+derive_dev_config() {
+    local slug="${SITE_DOMAIN//./-}"
+
+    DEV_PROJECT_NAME="${DEV_PROJECT_NAME:-wpdev-${slug}}"
+    DEV_HTTP_PORT="${DEV_HTTP_PORT:-8080}"
+    DEV_BIND_ADDR="${DEV_BIND_ADDR:-127.0.0.1}"
+    DEV_URL="${DEV_URL:-http://localhost:${DEV_HTTP_PORT}}"
+
+    # Same PHP version as production, but the apache flavour: it is a single
+    # self-contained container, no nginx needed on the host.
+    DEV_WP_IMAGE="${DEV_WP_IMAGE:-wordpress:php${PHP_VERSION}-apache}"
+    DEV_CLI_IMAGE="${DEV_CLI_IMAGE:-wordpress:cli}"
+
+    # The database is external: no container runs it. A loopback DB_HOST refers
+    # to the host from the container's point of view, so it becomes
+    # host.docker.internal (mapped via extra_hosts). Any other value is a real
+    # address and is used as is.
+    if [ -z "${DEV_DB_HOST:-}" ]; then
+        case "$DB_HOST" in
+            127.0.0.1|localhost|::1) DEV_DB_HOST="host.docker.internal" ;;
+            *)                       DEV_DB_HOST="$DB_HOST" ;;
+        esac
+    fi
+
+    # Keeps a dev install from colliding with production tables when both point
+    # at the same database server.
+    DEV_TABLE_PREFIX="${DEV_TABLE_PREFIX:-wp_}"
+
+    # Empty DEV_DOCROOT means "use a named volume" (no file-ownership friction).
+    # Set it to an absolute path to bind-mount the document root instead.
+    DEV_DOCROOT="${DEV_DOCROOT:-}"
+    DEV_WP_SOURCE="${DEV_DOCROOT:-wp_data}"
+
+    # Colon-separated absolute paths, mounted into wp-content/{plugins,themes}.
+    DEV_PLUGIN_DIRS="${DEV_PLUGIN_DIRS:-}"
+    DEV_THEME_DIRS="${DEV_THEME_DIRS:-}"
+
+    # Per-site scratch dir for generated compose overrides (gitignored).
+    DEV_STATE_DIR="${REPO_ROOT}/dev/${SITE_DOMAIN}"
 }
 
 # Print the resolved configuration without any secret.
@@ -143,4 +188,14 @@ print_site_config() {
     echo "  Nginx mode:   ${NGINX_MODE}"
     echo "  Nginx conf:   ${NGINX_CONF_FILE}"
     echo "  SSL dir:      ${SSL_DIR}"
+    echo ""
+    echo "  Dev (Docker, external database)"
+    echo "    URL:        ${DEV_URL}"
+    echo "    Project:    ${DEV_PROJECT_NAME}"
+    echo "    Image:      ${DEV_WP_IMAGE}"
+    echo "    DB from     container: ${DEV_DB_HOST}:${DB_PORT}/${DB_NAME} (prefix ${DEV_TABLE_PREFIX})"
+    echo "    Docroot:    ${DEV_DOCROOT:-named volume ${DEV_PROJECT_NAME}_wp_data}"
+    [ -n "${DEV_PLUGIN_DIRS}" ] && echo "    Plugins:    ${DEV_PLUGIN_DIRS}"
+    [ -n "${DEV_THEME_DIRS}" ]  && echo "    Themes:     ${DEV_THEME_DIRS}"
+    return 0
 }

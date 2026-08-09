@@ -1,9 +1,14 @@
 # AGENTS.md
 
-Host-based (non-Docker) WordPress provisioning for Ubuntu 24.04. No application
-code, build system or tests — bash scripts, an nginx template and a config
-template. `README.md` has the full picture; this file records only what is easy
-to get wrong.
+WordPress provisioning driven by one config file per site, in two modes:
+production on the host (Ubuntu 24.04, `bin/install-wordpress`) and development
+in Docker (`bin/dev`). No application code, build system or tests — bash
+scripts, an nginx template, a compose file and a config template. `README.md`
+has the full picture; this file records only what is easy to get wrong.
+
+**The database is external in both modes.** Nothing here ever starts a database
+container, and `bin/dev` deliberately has no `db` service. If a change would
+introduce one, that is a design change, not a fix.
 
 ## Hard rule: credentials never enter the repository
 
@@ -27,8 +32,31 @@ All executables live in `bin/` and take `--config sites/<domain>.env`. When
   MariaDB is only verified, never installed.
 - `bin/install-wordpress` — provisions one site end to end. **Root.**
   `--nginx-only` re-renders just the nginx site config (used by `console nginx`).
-- `bin/console <command>` — operations on an installed site. Some subcommands
+- `bin/console <command>` — operations on a host install. Some subcommands
   need root (`permissions`, `nginx`, `reload`, `ssl-renew`).
+- `bin/dev <command>` — Docker development stack. Never root; it adds `sudo` to
+  the Docker calls itself when the user is not in the `docker` group.
+
+## Development stack
+
+- Requires **Compose v2** (`docker compose`). v1 is not supported: the compose
+  file uses `profiles` and the Compose Spec, and carries no `version:` key.
+- `docker/compose.dev.yml` is only ever invoked through `bin/dev`, which exports
+  the `DB_*`/`DEV_*` variables it interpolates. Running `docker compose` against
+  it by hand yields empty substitutions.
+- Services: `wordpress` (apache image, the only one `up` starts) and `cli`
+  (`wordpress:cli`, in the `cli` profile, started per invocation by
+  `docker compose --profile cli run --rm -T cli`).
+- The container reaches the external database through `DEV_DB_HOST`, derived in
+  `derive_dev_config`: a loopback `DB_HOST` becomes `host.docker.internal`
+  (mapped via `extra_hosts: host-gateway`), anything else is passed through.
+- Extra plugin/theme bind mounts cannot be expressed in a static compose file,
+  so `write_override` in `bin/dev` generates `dev/<domain>/compose.override.yml`
+  from `DEV_PLUGIN_DIRS`/`DEV_THEME_DIRS` on every run. `dev/` is gitignored;
+  never hand-edit the generated file.
+- The document root defaults to a **named volume** (`DEV_WP_SOURCE=wp_data`) to
+  avoid uid-33 ownership problems; `DEV_DOCROOT=/abs/path` switches the same
+  compose entry to a bind mount.
 
 ## Conventions that matter
 
@@ -51,8 +79,12 @@ All executables live in `bin/` and take `--config sites/<domain>.env`. When
 
 `derive_site_config` (`lib/config.sh`) computes `NGINX_SITE_NAME`, `PHP_FPM_SOCK`,
 `PHP_FPM_SERVICE`, `SSL_CERT`/`SSL_KEY`, `NGINX_CONF_FILE`, `NGINX_ENABLED_LINK`,
-`ACCESS_LOG`, `ERROR_LOG`, `SITE_URL`, `WEB_USER`/`WEB_GROUP`. Add derived values
-there — do not add fields to the config template that can be computed.
+`ACCESS_LOG`, `ERROR_LOG`, `SITE_URL`, `WEB_USER`/`WEB_GROUP`, then calls
+`derive_dev_config` for the `DEV_*` set. Add derived values there — do not add
+fields to the config template that can be computed.
+
+`_REQUIRED_VARS` covers production fields only. Every `DEV_*` value is optional
+by design: a config written before the dev stack existed still works.
 
 ## nginx template
 
@@ -73,15 +105,22 @@ PHP-FPM socket.
 ```sh
 bash -n bin/* lib/*.sh
 shellcheck bin/* lib/*.sh          # if installed
-bash bin/new-site test.local --path /tmp/wp && bash bin/console --config sites/test.local.env info
-rm -f sites/test.local.env
+bash bin/new-site test.local --path /tmp/wp
+bash bin/console --config sites/test.local.env info
+bash bin/dev --config sites/test.local.env url        # needs no Docker
 ```
 
-Anything beyond that needs a real Ubuntu host with MariaDB; do not try to run
-the installer to "check" it.
+The compose file can be validated without a running daemon by exporting the
+same variables `bin/dev` exports and running `docker compose ... config`.
+Clean up with `rm -rf sites/test.local.env dev/test.local`.
+
+Anything beyond that needs a real host: an Ubuntu machine with MariaDB for the
+installer, Docker plus a reachable database for `bin/dev`. Do not run the
+installer just to "check" it.
 
 ## Out of scope
 
-Docker deployments. `examples/wordpress-docker-fpm.sh` is a legacy reference
-only — it does not read `sites/*.env` and is not maintained. The maintained
-Docker stack lives in the separate `General-Wordpress-Site` repository.
+`examples/wordpress-docker-fpm.sh` is a legacy reference only — it does not read
+`sites/*.env` and is not maintained. A separate Docker deployment for
+production lives in the `General-Wordpress-Site` repository; `bin/dev` here is
+for local development, not for serving a site.

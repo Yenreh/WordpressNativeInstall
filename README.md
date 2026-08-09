@@ -1,17 +1,24 @@
 # WordPress Installer
 
-Reproducible provisioning of WordPress sites **directly on the host** (no
-Docker): WordPress + WP-CLI, PHP-FPM over a unix socket, MariaDB, nginx and TLS.
+Reproducible provisioning of WordPress sites, in two modes driven by the same
+per-site configuration file:
+
+| Mode            | Command                 | What runs where                                                        |
+|-----------------|-------------------------|------------------------------------------------------------------------|
+| **Production**  | `bin/install-wordpress` | Everything on the host: PHP-FPM, nginx, TLS. Ubuntu 24.04 LTS.         |
+| **Development** | `bin/dev`               | WordPress in Docker. No PHP and no nginx on the host.                  |
+
+In **both** modes the **database is external**: MariaDB/MySQL runs on the host
+or on another server and its credentials come from the site config. No database
+container is ever started.
 
 One repository can provision many sites. Everything a site needs lives in a
 single file, `sites/<domain>.env`, which is **gitignored**: no credential ever
 reaches the repository.
 
-Target platform: Ubuntu 24.04 LTS (noble).
-
 ---
 
-## Architecture
+## Architecture — production (`bin/install-wordpress`)
 
 ```
                     +-----------------------------+
@@ -41,6 +48,28 @@ nginx terminates TLS and serves static assets itself; only `.php` goes to
 PHP-FPM through `/run/php/php<version>-fpm.sock`. Each site gets its own
 database, its own database user and its own certificate directory.
 
+## Architecture — development (`bin/dev`)
+
+```
+                    +-----------------------------+
+   browser  --->    | WordPress container         |
+   http://          | wordpress:php8.3-apache     |
+   localhost:8080   | 127.0.0.1:8080 -> :80       |
+                    | docroot in a named volume   |
+                    | (or a bind mount)           |
+                    +--------------+--------------+
+                                   | host.docker.internal
+                                   v
+                    +-----------------------------+
+                    | External MariaDB/MySQL      |
+                    | on the host or remote —     |
+                    | NOT containerized           |
+                    +-----------------------------+
+```
+
+A single container serves the site; WP-CLI runs on demand in a second,
+short-lived container (`bin/dev wp ...`). The host only needs Docker.
+
 ---
 
 ## Repository layout
@@ -50,7 +79,9 @@ database, its own database user and its own certificate directory.
 | `bin/new-site`            | Creates `sites/<domain>.env` with generated passwords (mode 600).    |
 | `bin/check-prerequisites` | Verifies and installs the host stack (nginx, PHP, WP-CLI, utils).    |
 | `bin/install-wordpress`   | Provisions one site end to end from its config file.                 |
-| `bin/console`             | Day-to-day operations on an installed site.                          |
+| `bin/console`             | Day-to-day operations on a host install.                             |
+| `bin/dev`                 | Development stack in Docker (up, wp, logs, status, down).            |
+| `docker/compose.dev.yml`  | Compose file for the development stack. Driven only by `bin/dev`.    |
 | `lib/common.sh`           | Logging, prompts, template rendering, password generation.           |
 | `lib/config.sh`           | Locates, loads, validates and derives the site configuration.        |
 | `nginx/site.conf.tpl`     | nginx site template (`{{TOKEN}}` placeholders).                      |
@@ -62,6 +93,8 @@ database, its own database user and its own certificate directory.
 
 ## Prerequisites
 
+**Production mode**
+
 - Ubuntu 24.04 LTS with root access.
 - MariaDB >= 11.4 already installed, running, and reachable as root over the
   local socket (`sudo mariadb -e 'SELECT 1;'`). This is the one component the
@@ -70,9 +103,16 @@ database, its own database user and its own certificate directory.
 - Everything else (nginx from nginx.org, PHP-FPM + WordPress extensions,
   WP-CLI, base utilities) is installed by `bin/check-prerequisites`.
 
+**Development mode**
+
+- Docker with the Compose **v2** plugin (`docker compose`). Nothing else: no
+  PHP, no nginx, no WP-CLI on the host.
+- A reachable MariaDB/MySQL server with the database and user already created
+  (see [Development stack](#development-stack-bindev)).
+
 ---
 
-## Quick start
+## Quick start — production
 
 ```sh
 # 1. Create the site config (generates strong random passwords, mode 600).
@@ -97,6 +137,83 @@ certificate, renders the nginx site config and reloads nginx and PHP-FPM.
 
 When `sites/` holds exactly one config, `--config` can be omitted. With several
 sites, pass it explicitly or export `WP_SITE_CONFIG`.
+
+---
+
+## Development stack (`bin/dev`)
+
+Runs the site locally in Docker. Useful when the machine has no PHP and you do
+not want to install one.
+
+```sh
+bash bin/new-site example.com          # same config file as production
+bash bin/dev --config sites/example.com.env up
+```
+
+`up` starts the container, waits for the WordPress core files, checks the
+database connection and runs the installer if the site is not installed yet.
+The URL is printed at the end (`http://localhost:<DEV_HTTP_PORT>`).
+
+```sh
+D="bash bin/dev --config sites/example.com.env"
+
+$D up                 # start (and install on first run)
+$D up --no-install    # start without touching the database content
+$D status             # containers, database reachability, WordPress state
+$D logs               # follow the WordPress container log
+$D wp plugin list     # WP-CLI inside a throwaway container
+$D shell              # shell in the WordPress container
+$D db-dump            # dump the database into backups/
+$D stop               # stop, keep everything
+$D down               # remove container + network (volume preserved)
+$D down --volumes     # also delete the WordPress files volume
+```
+
+`down --volumes` never touches the database: it is external.
+
+### The database is external
+
+`bin/dev` starts no database container. It reuses `DB_HOST`, `DB_PORT`,
+`DB_NAME`, `DB_USER` and `DB_PASSWORD` from the site config, so **the database
+and its user must exist beforehand**:
+
+```sql
+CREATE DATABASE `wp_example_com` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'wp_example_com'@'%' IDENTIFIED BY '<DB_PASSWORD from the site config>';
+GRANT ALL PRIVILEGES ON `wp_example_com`.* TO 'wp_example_com'@'%';
+```
+
+`DB_HOST` is interpreted from the container's point of view:
+
+| `DB_HOST` in the config | Used by the container    | Meaning                          |
+|-------------------------|--------------------------|----------------------------------|
+| `127.0.0.1`/`localhost` | `host.docker.internal`   | Server on the Docker host        |
+| anything else           | as is                    | Remote server                    |
+
+Override with `DEV_DB_HOST` when neither applies. Two things commonly block a
+host database: `bind-address = 127.0.0.1` in the MariaDB config (the container
+arrives over the Docker bridge, not over loopback), and a grant limited to
+`'user'@'localhost'`. `bin/dev up` diagnoses both and stops before installing.
+
+If dev and production share the same database server, set `DEV_TABLE_PREFIX`
+(for example `wpdev_`) so the two installs do not collide in the same schema.
+
+### Developing plugins and themes
+
+Mount local directories straight into `wp-content` from the site config:
+
+```sh
+DEV_PLUGIN_DIRS="/home/user/GIT/my-plugin:/home/user/GIT/other-plugin"
+DEV_THEME_DIRS="/home/user/GIT/my-theme"
+```
+
+`bin/dev` renders these into `dev/<domain>/compose.override.yml` (gitignored) on
+every run. By default the document root itself lives in a Docker named volume,
+which avoids file-ownership friction; set `DEV_DOCROOT=/abs/path` to bind-mount
+the whole document root instead.
+
+If your user is not in the `docker` group, `bin/dev` detects it and re-runs the
+Docker calls through `sudo` (pass `--no-sudo` to refuse).
 
 ---
 
@@ -126,11 +243,15 @@ DB_PASSWORD="..."                # generated by bin/new-site
 
 PHP_VERSION="8.3"
 NGINX_MODE="nginxorg"            # nginxorg | ubuntu
+
+DEV_HTTP_PORT="8080"             # dev only; bin/new-site picks a free port
 ```
 
 Derived automatically: `NGINX_SITE_NAME` (domain with dots turned into dashes),
-`PHP_FPM_SOCK`, `SSL_CERT` / `SSL_KEY`, the nginx config path, the log paths and
-`SITE_URL`. Any of them can still be overridden in the config file.
+`PHP_FPM_SOCK`, `SSL_CERT` / `SSL_KEY`, the nginx config path, the log paths,
+`SITE_URL`, and the whole `DEV_*` set (`DEV_URL`, `DEV_PROJECT_NAME`,
+`DEV_WP_IMAGE`, `DEV_DB_HOST`, ...). Any of them can still be overridden in the
+config file; see `config/site.env.example` for the full list.
 
 ### `NGINX_MODE`
 
