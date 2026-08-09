@@ -127,6 +127,10 @@ write_override() {
         printf '%s\n' "${entries[@]}"
     } > "$file"
 
+    # Under sudo this would otherwise leave root-owned files inside the repo,
+    # which the user can no longer edit or delete.
+    chown -R "${DEV_UID}:${DEV_GID}" "$dir" 2>/dev/null || true
+
     OVERRIDE_ARGS=(-f "$file")
 }
 
