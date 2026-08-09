@@ -163,6 +163,12 @@ derive_dev_config() {
     # at the same database server.
     DEV_TABLE_PREFIX="${DEV_TABLE_PREFIX:-wp_}"
 
+    # Dev reuses one connection account for every site instead of a dedicated
+    # user per database, so `bin/dev up` creates a missing database itself when
+    # that account is allowed to. Production keeps the opposite model: one
+    # dedicated user per database, created by bin/install-wordpress.
+    DEV_DB_AUTOCREATE="${DEV_DB_AUTOCREATE:-true}"
+
     # Empty DEV_DOCROOT means "use a named volume". Set an absolute path to
     # bind-mount the document root and browse/edit the files from the host.
     DEV_DOCROOT="${DEV_DOCROOT:-}"
@@ -199,6 +205,7 @@ print_site_config() {
     echo "    Project:    ${DEV_PROJECT_NAME}"
     echo "    Image:      ${DEV_WP_IMAGE}"
     echo "    DB from     container: ${DEV_DB_HOST}:${DB_PORT}/${DB_NAME} (prefix ${DEV_TABLE_PREFIX})"
+    echo "    Autocreate: ${DEV_DB_AUTOCREATE}"
     echo "    Docroot:    ${DEV_DOCROOT:-named volume ${DEV_PROJECT_NAME}_wp_data}"
     [ -n "${DEV_PLUGIN_DIRS}" ] && echo "    Plugins:    ${DEV_PLUGIN_DIRS}"
     [ -n "${DEV_THEME_DIRS}" ]  && echo "    Themes:     ${DEV_THEME_DIRS}"

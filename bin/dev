@@ -195,14 +195,33 @@ cmd_up() {
     done
 
     step "Checking database connectivity from the container"
-    local check_output
+    local check_output create_output
     if check_output="$(wp_cli db check 2>&1)"; then
         ok "Connected to ${DB_NAME} at ${DEV_DB_HOST}:${DB_PORT}"
+    elif [ "$DEV_DB_AUTOCREATE" = true ] && create_output="$(wp_cli db create 2>&1)"; then
+        # The connection account is allowed to create databases, which is the
+        # whole point of sharing one account across dev sites.
+        ok "Database ${DB_NAME} did not exist and was created"
+        if check_output="$(wp_cli db check 2>&1)"; then
+            ok "Connected to ${DB_NAME} at ${DEV_DB_HOST}:${DB_PORT}"
+        else
+            err "The database was created but the check still fails:"
+            printf '      %s\n' "$check_output"
+            die "Database unusable."
+        fi
     else
         err "The database check failed. Reported error:"
         echo ""
         printf '      %s\n' "$check_output"
         echo ""
+        if [ "$DEV_DB_AUTOCREATE" = true ]; then
+            info "Creating ${DB_NAME} automatically also failed:"
+            printf '      %s\n' "${create_output:-<no output>}"
+            echo ""
+        else
+            info "DEV_DB_AUTOCREATE is disabled, so the database was not created for you."
+            echo ""
+        fi
 
         # Separate a network problem from an authentication/permission one.
         info "Probing the TCP port from inside the container..."
@@ -212,11 +231,16 @@ cmd_up() {
         then
             ok "${DEV_DB_HOST}:${DB_PORT} is reachable from the container — so this is not a network problem."
             echo ""
-            echo "    Then the credentials or the grants are the issue:"
+            echo "    Then it is the credentials or the grants of '${DB_USER}'."
+            echo "    Dev expects one connection account reused across sites, allowed to"
+            echo "    create its databases:"
+            echo "      GRANT ALL PRIVILEGES ON *.* TO '${DB_USER}'@'%';   -- or at least CREATE"
+            echo ""
+            echo "    Otherwise create the database by hand and set DEV_DB_AUTOCREATE=\"false\":"
             echo "      CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            echo "      CREATE USER '${DB_USER}'@'%' IDENTIFIED BY '<the DB_PASSWORD from your site config>';"
             echo "      GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%';"
-            echo "    A grant limited to 'localhost' does not cover the container."
+            echo ""
+            echo "    A grant limited to 'localhost' never covers the container."
         else
             err "${DEV_DB_HOST}:${DB_PORT} is NOT reachable from the container — this is a network problem."
             echo ""

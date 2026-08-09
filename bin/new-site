@@ -127,6 +127,7 @@ NGINX_MODE="${NGINX_MODE_ARG}"
 DEV_HTTP_PORT="${DEV_PORT}"
 # DEV_DB_HOST="host.docker.internal"   # derived from DB_HOST when unset
 # DEV_TABLE_PREFIX="wpdev_"            # only if dev and prod share a DB server
+# DEV_DB_AUTOCREATE="false"            # default true: bin/dev creates a missing DB
 # DEV_PLUGIN_DIRS="/abs/path/to/plugin"
 # DEV_THEME_DIRS="/abs/path/to/theme"
 

@@ -10,6 +10,13 @@ has the full picture; this file records only what is easy to get wrong.
 container, and `bin/dev` deliberately has no `db` service. If a change would
 introduce one, that is a design change, not a fix.
 
+The two modes use opposite database models on purpose. Production: one dedicated
+user per database, created by `bin/install-wordpress` as MariaDB root, granted
+only on its own schema. Development: a single connection account reused across
+sites, expected to hold `CREATE`, so `bin/dev up` creates a missing database
+itself (`DEV_DB_AUTOCREATE`, default `true`) and no user is ever created or
+dropped. Do not "unify" them.
+
 ## Hard rule: credentials never enter the repository
 
 - Real site configs live in `sites/<domain>.env` (gitignored, mode 600) and hold

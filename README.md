@@ -174,16 +174,31 @@ $D down --volumes     # also delete the WordPress files volume
 ### The database is external
 
 `bin/dev` starts no database container. It reuses `DB_HOST`, `DB_PORT`,
-`DB_NAME`, `DB_USER` and `DB_PASSWORD` from the site config, so **the database
-and its user must exist beforehand**:
+`DB_NAME`, `DB_USER` and `DB_PASSWORD` from the site config.
+
+The two modes use **opposite database models**, on purpose:
+
+| | Production | Development |
+|---|---|---|
+| Account | one dedicated user per database | one connection account reused by every local site |
+| Privileges | `GRANT ALL ON <db>.*` only | needs `CREATE` (typically `ON *.*`) |
+| Who creates the database | `bin/install-wordpress`, as MariaDB root | `bin/dev up`, with that same account |
+| Rationale | blast radius: a compromised site cannot read the others | no user churn when spinning sites up and down |
+
+So in dev you point every site at the same `DB_USER`/`DB_PASSWORD`, give each a
+distinct `DB_NAME`, and `bin/dev up` creates the database the first time. That
+is `DEV_DB_AUTOCREATE`, enabled by default. Set it to `"false"` to require the
+database to exist:
 
 ```sql
 CREATE DATABASE `wp_example_com` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'wp_example_com'@'%' IDENTIFIED BY '<DB_PASSWORD from the site config>';
-GRANT ALL PRIVILEGES ON `wp_example_com`.* TO 'wp_example_com'@'%';
+GRANT ALL PRIVILEGES ON `wp_example_com`.* TO '<DB_USER>'@'%';
 ```
 
-`DB_HOST` is interpreted from the container's point of view:
+The account must reach the server **from the container**, so a grant limited to
+`'user'@'localhost'` never works — use `'%'` or the Docker subnet.
+
+`DB_HOST` itself is interpreted from the container's point of view:
 
 | `DB_HOST` in the config | Used by the container    | Meaning                          |
 |-------------------------|--------------------------|----------------------------------|
