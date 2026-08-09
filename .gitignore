@@ -1,0 +1,17 @@
+# Per-site configuration: contains database and admin credentials. Never commit.
+sites/*
+!sites/.gitkeep
+.env
+*.env
+!config/site.env.example
+
+# Local artifacts
+backups/
+*.log
+*.bak
+*.orig
+
+# Editor / tooling
+.claude/
+.idea/
+.vscode/
