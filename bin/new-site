@@ -6,6 +6,7 @@
 #   bin/new-site <domain> [--title "Site title"] [--email admin@domain]
 #                         [--locale es_ES] [--path /apps/wordpress/<d>/html]
 #                         [--nginx-mode nginxorg|ubuntu] [--dev-port 8080]
+#                         [--dev-docroot /abs/path]
 #                         [--force]
 #
 # Writes sites/<domain>.env with mode 600 and freshly generated passwords.
@@ -27,6 +28,7 @@ WP_PATH_ARG=""
 NGINX_MODE_ARG="nginxorg"
 PHP_VERSION_ARG="8.3"
 DEV_PORT_ARG=""
+DEV_DOCROOT_ARG=""
 FORCE=false
 
 while [ $# -gt 0 ]; do
@@ -39,6 +41,7 @@ while [ $# -gt 0 ]; do
         --nginx-mode)  NGINX_MODE_ARG="$2"; shift 2 ;;
         --php-version) PHP_VERSION_ARG="$2"; shift 2 ;;
         --dev-port)    DEV_PORT_ARG="$2"; shift 2 ;;
+        --dev-docroot) DEV_DOCROOT_ARG="$2"; shift 2 ;;
         --force)       FORCE=true; shift ;;
         -*)            die "Unknown option: $1" ;;
         *)             [ -z "$DOMAIN" ] && DOMAIN="$1" || die "Unexpected argument: $1"; shift ;;
@@ -58,6 +61,17 @@ SLUG="${SLUG//-/_}"
 TITLE="${TITLE:-$DOMAIN}"
 EMAIL="${EMAIL:-admin@${DOMAIN}}"
 WP_PATH_ARG="${WP_PATH_ARG:-/apps/wordpress/${DOMAIN}/html}"
+# Dev files live beside the generated compose override, under the gitignored
+# dev/ directory, so everything for a local site sits in one place.
+DEV_DOCROOT_ARG="${DEV_DOCROOT_ARG:-${REPO_ROOT}/dev/${DOMAIN}/html}"
+
+# Values the scripts would derive on their own. They are written into the file
+# as commented lines so every knob is visible and editable in one place.
+NGINX_SITE_NAME_DEFAULT="${DOMAIN//./-}"
+DEV_PROJECT_DEFAULT="wpdev-${DOMAIN//./-}"
+DEV_DB_HOST_DEFAULT="host.docker.internal"   # DB_HOST below is loopback
+DEV_UID_DEFAULT="${SUDO_UID:-$(id -u)}"
+DEV_GID_DEFAULT="${SUDO_GID:-$(id -g)}"
 
 # MariaDB identifiers are limited to 64 characters; keep well below that.
 DB_NAME="wp_${SLUG}"
@@ -103,7 +117,7 @@ SITE_TITLE="${TITLE}"
 SITE_LOCALE="${LOCALE}"
 WP_VERSION="latest"
 
-# --- Paths ---
+# --- Paths (production) ---
 WP_PATH="${WP_PATH_ARG}"
 SSL_DIR="/apps/ssl/${DOMAIN}"
 
@@ -119,21 +133,44 @@ DB_NAME="${DB_NAME}"
 DB_USER="${DB_USER}"
 DB_PASSWORD="${DB_PASSWORD}"
 
-# --- Web stack ---
+# --- Web stack (production) ---
 PHP_VERSION="${PHP_VERSION_ARG}"
-NGINX_MODE="${NGINX_MODE_ARG}"
+NGINX_MODE="${NGINX_MODE_ARG}"      # nginxorg (conf.d) | ubuntu (sites-available)
 
-# --- Dev stack (bin/dev, Docker; the database stays external) ---
+# Optional, shown with the value that is derived when the line stays commented.
+# NGINX_SITE_NAME="${NGINX_SITE_NAME_DEFAULT}"
+# PHP_FPM_SOCK="/run/php/php${PHP_VERSION_ARG}-fpm.sock"
+# CLIENT_MAX_BODY_SIZE="64M"          # keep in sync with php.ini
+# WEB_USER="www-data"
+# WEB_GROUP="www-data"
+
+# =============================================================================
+# Dev stack (bin/dev, Docker). Ignored by the production installer.
+# The database is external here too, but one connection account is reused
+# across every local site and is expected to be able to create databases.
+# =============================================================================
 DEV_HTTP_PORT="${DEV_PORT}"
-# DEV_DB_HOST="host.docker.internal"   # derived from DB_HOST when unset
-# DEV_TABLE_PREFIX="wpdev_"            # only if dev and prod share a DB server
-# DEV_DB_AUTOCREATE="false"            # default true: bin/dev creates a missing DB
-# DEV_PLUGIN_DIRS="/abs/path/to/plugin"
-# DEV_THEME_DIRS="/abs/path/to/theme"
 
-# --- Optional overrides (see config/site.env.example) ---
-# NGINX_SITE_NAME="${DOMAIN//./-}"
-# CLIENT_MAX_BODY_SIZE="64M"
+# Where the WordPress files land in dev. They belong to your user, so you can
+# edit them without sudo. Comment this out to keep them in a Docker named
+# volume instead (nothing visible on the host).
+DEV_DOCROOT="${DEV_DOCROOT_ARG}"
+
+# Optional, shown with the value that is derived when the line stays commented.
+# DEV_BIND_ADDR="127.0.0.1"           # 0.0.0.0 exposes the site to the LAN
+# DEV_URL="http://localhost:${DEV_PORT}"
+# DEV_PROJECT_NAME="${DEV_PROJECT_DEFAULT}"
+# DEV_WP_IMAGE="wordpress:php${PHP_VERSION_ARG}-apache"
+# DEV_CLI_IMAGE="wordpress:cli"
+# DEV_DB_HOST="${DEV_DB_HOST_DEFAULT}"   # DB address as seen from the container
+# DEV_TABLE_PREFIX="wp_"              # change it if dev and prod share a database
+# DEV_DB_AUTOCREATE="true"            # false: the database must exist beforehand
+# DEV_UID="${DEV_UID_DEFAULT}"                 # identity the containers run as
+# DEV_GID="${DEV_GID_DEFAULT}"
+
+# Local directories mounted live into wp-content (colon-separated, absolute).
+# DEV_PLUGIN_DIRS="/abs/path/to/plugin:/abs/path/to/another"
+# DEV_THEME_DIRS="/abs/path/to/theme"
 EOF
 chmod 600 "$TARGET"
 
@@ -143,6 +180,7 @@ ok "Admin user: wp_admin — password generated (24 chars)"
 ok "Database:   ${DB_NAME} / ${DB_USER} — password generated (24 chars)"
 echo ""
 ok "Dev port:   ${DEV_PORT} (http://localhost:${DEV_PORT})"
+ok "Dev files:  ${DEV_DOCROOT_ARG}"
 echo ""
 info "Review the file, then either provision the host stack:"
 echo "    sudo bash bin/check-prerequisites --config ${TARGET}"
