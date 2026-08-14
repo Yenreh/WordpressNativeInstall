@@ -8,6 +8,15 @@
 # Usage:
 #   sudo bash bin/install-wordpress --config sites/<domain>.env [--yes]
 #                                   [--skip-nginx] [--skip-ssl]
+#                                   [--write-mode locked|dashboard]
+#
+# --write-mode overrides WP_WRITE_MODE from the config for this run:
+#   locked (default) - the code belongs to root, PHP writes only the paths in
+#                      WP_WRITABLE_PATHS, and wp-config.php gets
+#                      DISALLOW_FILE_MODS. Updates run through `bin/console wp`.
+#   dashboard        - the web user owns the whole document root and
+#                      FS_METHOD=direct, so wp-admin installs and updates itself.
+#                      Only reasonable when the site is not exposed.
 #
 # Every value comes from the site config file; nothing is hardcoded here.
 # Create the config first with: bin/new-site <domain>
@@ -27,6 +36,7 @@ CONFIG_ARG=""
 SKIP_NGINX=false
 SKIP_SSL=false
 NGINX_ONLY=false      # used by `console nginx` to re-render the site config
+WRITE_MODE_ARG=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -36,9 +46,15 @@ while [ $# -gt 0 ]; do
         --skip-nginx) SKIP_NGINX=true; shift ;;
         --skip-ssl)   SKIP_SSL=true; shift ;;
         --nginx-only) NGINX_ONLY=true; shift ;;
+        --write-mode) WRITE_MODE_ARG="$2"; shift 2 ;;
         *)            die "Unknown option: $1" ;;
     esac
 done
+
+# Exported so `console permissions`, spawned later, applies the same mode.
+if [ -n "$WRITE_MODE_ARG" ]; then
+    export WP_WRITE_MODE_OVERRIDE="$WRITE_MODE_ARG"
+fi
 
 # -----------------------------------------------------------------------------
 verify_prerequisites() {
@@ -119,19 +135,25 @@ setup_database() {
     db_root -e "DROP USER IF EXISTS '${DB_USER}'@'${DB_HOST}';" 2>/dev/null || true
     db_root -e "DROP USER IF EXISTS '${DB_USER}'@'localhost';" 2>/dev/null || true
 
-    db_root -e "CREATE USER '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASSWORD}';"
-    db_root -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}';"
+    # Fed through stdin, not -e: a statement carrying the password would show up
+    # in the process list of every local user for as long as the client runs.
+    db_root <<SQL
+CREATE USER '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASSWORD}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${DB_HOST}';
+SQL
 
     # WordPress may resolve the host as 'localhost' (socket) instead of 127.0.0.1.
     if [ "$DB_HOST" != "localhost" ]; then
-        db_root -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';"
-        db_root -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+        db_root <<SQL
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+SQL
     fi
 
     db_root -e "FLUSH PRIVILEGES;"
     ok "User '${DB_USER}'@'${DB_HOST}' granted on '${DB_NAME}'"
 
-    if db_root -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" -e "USE \`${DB_NAME}\`;" &>/dev/null; then
+    if db_as_user "$(db_client)" -e "USE \`${DB_NAME}\`;" &>/dev/null; then
         ok "Connectivity for '${DB_USER}' verified"
     else
         warn "Could not verify connectivity for '${DB_USER}' on ${DB_HOST}:${DB_PORT}"
@@ -176,9 +198,18 @@ create_wp_config() {
     wp config set WP_DEBUG false --raw --path="$WP_PATH" --allow-root
     wp config set WP_DEBUG_LOG false --raw --path="$WP_PATH" --allow-root
     wp config set DISALLOW_FILE_EDIT true --raw --path="$WP_PATH" --allow-root
-    wp config set FS_METHOD "direct" --path="$WP_PATH" --allow-root
 
-    ok "wp-config.php generated (table prefix '${DB_TABLE_PREFIX}', WP_DEBUG=false, DISALLOW_FILE_EDIT=true)"
+    # These two follow WP_WRITE_MODE: FS_METHOD=direct only makes sense when PHP
+    # actually owns the code, and in the locked mode the dashboard must not offer
+    # an install or update it cannot perform (it would fall back to asking for
+    # FTP credentials).
+    if [ "$WP_WRITE_MODE" = "dashboard" ]; then
+        wp config set FS_METHOD "direct" --path="$WP_PATH" --allow-root
+        ok "wp-config.php generated (prefix '${DB_TABLE_PREFIX}', WP_DEBUG=false, DISALLOW_FILE_EDIT=true, FS_METHOD=direct)"
+    else
+        wp config set DISALLOW_FILE_MODS true --raw --path="$WP_PATH" --allow-root
+        ok "wp-config.php generated (prefix '${DB_TABLE_PREFIX}', WP_DEBUG=false, DISALLOW_FILE_EDIT=true, DISALLOW_FILE_MODS=true)"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -215,9 +246,11 @@ install_core() {
 
 # -----------------------------------------------------------------------------
 set_permissions() {
-    step "Setting file permissions"
+    step "Setting file permissions (mode: ${WP_WRITE_MODE})"
+    # WP_WRITE_MODE_OVERRIDE, when --write-mode was given, is exported and thus
+    # inherited by this child; otherwise both read the same config file.
     bash "${REPO_ROOT}/bin/console" --config "$SITE_CONFIG_FILE" permissions --quiet
-    ok "Ownership ${WEB_USER}:${WEB_GROUP} | dirs 755 | files 644 | wp-content 775 | wp-config.php 640"
+    ok "Owner ${WP_OWNER_USER}:${WP_OWNER_GROUP} | dirs 755 | files 644 | ${WEB_USER} writes ${WP_WRITABLE_PATHS} | wp-config.php 640"
 }
 
 # -----------------------------------------------------------------------------
@@ -237,11 +270,14 @@ setup_ssl() {
     fi
 
     info "Generating a self-signed certificate for ${SITE_DOMAIN}..."
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    # umask first: openssl creates the key under the current umask, so without
+    # this it exists world-readable until the chmod below runs.
+    ( umask 077
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "$SSL_KEY" \
         -out "$SSL_CERT" \
         -subj "/CN=${SITE_DOMAIN}" \
-        -addext "subjectAltName=DNS:${SITE_DOMAIN}" 2>/dev/null
+        -addext "subjectAltName=DNS:${SITE_DOMAIN}" 2>/dev/null )
 
     chmod 600 "$SSL_KEY"
     chmod 644 "$SSL_CERT"
@@ -304,6 +340,7 @@ setup_nginx() {
     render_template "$NGINX_TEMPLATE" \
         "LISTEN_443=${listen_443}" \
         "DOMAIN=${SITE_DOMAIN}" \
+        "SITE_KEY=${NGINX_SITE_NAME}" \
         "DOCROOT=${WP_PATH}" \
         "PHP_FPM_SOCK=${PHP_FPM_SOCK}" \
         "SSL_CERT=${SSL_CERT}" \
@@ -368,6 +405,10 @@ print_summary() {
     echo "    Admin and database passwords are stored in: ${SITE_CONFIG_FILE}"
     echo "    They are intentionally not printed here."
     echo ""
+    echo "  ${C_BLUE}Files${C_NC}"
+    echo "    Mode:       ${WP_WRITE_MODE} (owner ${WP_OWNER_USER}:${WP_OWNER_GROUP})"
+    echo "    ${WEB_USER} writes: ${WP_WRITABLE_PATHS}"
+    echo ""
     echo "  ${C_BLUE}Paths${C_NC}"
     echo "    WordPress:  ${WP_PATH}"
     echo "    wp-config:  ${WP_PATH}/wp-config.php (640)"
@@ -380,6 +421,17 @@ print_summary() {
     echo "    - The certificate is SELF-SIGNED. For production use Let's Encrypt:"
     echo "        sudo apt install certbot python3-certbot-nginx"
     echo "        sudo certbot --nginx -d ${SITE_DOMAIN}"
+    if [ "$WP_WRITE_MODE" = "locked" ]; then
+        echo "    - wp-admin cannot install or update anything (DISALLOW_FILE_MODS),"
+        echo "      and that also disables the automatic security updates. Keep the"
+        echo "      site patched from the host, ideally from cron:"
+        echo "        sudo bash bin/console --config ${SITE_CONFIG_FILE} wp core update --minor"
+        echo "        sudo bash bin/console --config ${SITE_CONFIG_FILE} wp plugin update --all"
+        echo "        sudo bash bin/console --config ${SITE_CONFIG_FILE} permissions"
+    else
+        echo "    - WP_WRITE_MODE is 'dashboard': PHP owns the whole document root and"
+        echo "      can rewrite the code it runs. Prefer 'locked' on an exposed site."
+    fi
     echo "    - Day-to-day operations: bash bin/console --config ${SITE_CONFIG_FILE} <command>"
     echo ""
     echo "${C_GREEN}${C_BOLD}================================================================${C_NC}"

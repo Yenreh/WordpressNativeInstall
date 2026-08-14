@@ -7,7 +7,7 @@
 #                         [--locale es_ES] [--path /apps/wordpress/<d>/html]
 #                         [--nginx-mode nginxorg|ubuntu] [--dev-port 8080]
 #                         [--dev-docroot /abs/path] [--random-prefix]
-#                         [--force]
+#                         [--write-mode locked|dashboard] [--force]
 #
 # Writes sites/<domain>.env with mode 600 and freshly generated passwords.
 # The sites/ directory is gitignored: credentials never reach the repository.
@@ -30,6 +30,7 @@ PHP_VERSION_ARG="8.3"
 DEV_PORT_ARG=""
 DEV_DOCROOT_ARG=""
 RANDOM_PREFIX=false
+WRITE_MODE="locked"
 FORCE=false
 
 while [ $# -gt 0 ]; do
@@ -44,6 +45,7 @@ while [ $# -gt 0 ]; do
         --dev-port)    DEV_PORT_ARG="$2"; shift 2 ;;
         --dev-docroot) DEV_DOCROOT_ARG="$2"; shift 2 ;;
         --random-prefix) RANDOM_PREFIX=true; shift ;;
+        --write-mode)  WRITE_MODE="$2"; shift 2 ;;
         --force)       FORCE=true; shift ;;
         -*)            die "Unknown option: $1" ;;
         *)             [ -z "$DOMAIN" ] && DOMAIN="$1" || die "Unexpected argument: $1"; shift ;;
@@ -55,6 +57,11 @@ done
 case "$NGINX_MODE_ARG" in
     nginxorg|ubuntu) ;;
     *) die "Invalid --nginx-mode '${NGINX_MODE_ARG}'. Use 'nginxorg' or 'ubuntu'." ;;
+esac
+
+case "$WRITE_MODE" in
+    locked|dashboard) ;;
+    *) die "Invalid --write-mode '${WRITE_MODE}'. Use 'locked' or 'dashboard'." ;;
 esac
 
 # Derived defaults.
@@ -157,6 +164,22 @@ ${PREFIX_LINE}
 PHP_VERSION="${PHP_VERSION_ARG}"
 NGINX_MODE="${NGINX_MODE_ARG}"      # nginxorg (conf.d) | ubuntu (sites-available)
 
+# Who owns the WordPress files, i.e. what PHP can rewrite while serving traffic.
+#   locked    - code owned by root, group www-data. PHP writes only the paths in
+#               WP_WRITABLE_PATHS, wp-admin cannot install or update anything
+#               (DISALLOW_FILE_MODS), and updates run from the host:
+#                   sudo bash bin/console --config <this file> wp core update --minor
+#               Note this also turns off WordPress automatic security updates,
+#               so schedule those commands.
+#   dashboard - www-data owns everything and FS_METHOD=direct, so wp-admin
+#               updates itself. Any file-write bug then rewrites running code:
+#               only for a site that is not exposed to the internet.
+WP_WRITE_MODE="${WRITE_MODE}"
+
+# Colon-separated, relative to WP_PATH: handed to www-data in either mode.
+# Add a directory here when a plugin genuinely needs to write outside uploads.
+# WP_WRITABLE_PATHS="wp-content/uploads"
+
 # Optional, shown with the value that is derived when the line stays commented.
 # NGINX_SITE_NAME="${NGINX_SITE_NAME_DEFAULT}"
 # PHP_FPM_SOCK="/run/php/php${PHP_VERSION_ARG}-fpm.sock"
@@ -199,6 +222,7 @@ ok "File: ${TARGET} (mode 600, gitignored)"
 ok "Admin user: wp_admin — password generated (24 chars)"
 ok "Database:   ${DB_NAME} / ${DB_USER} — password generated (24 chars)"
 ok "Table prefix: ${TABLE_PREFIX}$([ "$RANDOM_PREFIX" = true ] && echo " (randomized)" || echo " (default)")"
+ok "Write mode:   ${WRITE_MODE}$([ "$WRITE_MODE" = locked ] && echo " (code owned by root; updates from the host)" || echo " (www-data owns the code; wp-admin can update itself)")"
 echo ""
 ok "Dev port:   ${DEV_PORT} (http://localhost:${DEV_PORT})"
 ok "Dev files:  ${DEV_DOCROOT_ARG}"

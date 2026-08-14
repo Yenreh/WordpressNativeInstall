@@ -328,15 +328,38 @@ install_wpcli() {
     echo ""
     info "Installing WP-CLI..."
     local url="https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar"
-    local tmp="/tmp/wp-cli.phar"
+    # A private directory, not a fixed /tmp path: this runs as root, and a
+    # pre-created symlink at a predictable name turns the download into an
+    # arbitrary file overwrite.
+    local tmpdir tmp
+    tmpdir="$(mktemp -d)" || die "Cannot create a temporary directory."
+    tmp="${tmpdir}/wp-cli.phar"
 
-    curl -fsSL "$url" -o "$tmp"
+    curl -fsSL "$url" -o "$tmp" || { rm -rf "$tmpdir"; die "Could not download WP-CLI."; }
+
+    # Integrity check against the checksum published beside the phar. It catches
+    # a corrupted or truncated download; it is not a signature.
+    local published actual
+    if published="$(curl -fsSL "${url}.sha512" 2>/dev/null)"; then
+        published="$(awk '{print $1}' <<< "$published")"
+        actual="$(sha512sum "$tmp" | awk '{print $1}')"
+        if [ -n "$published" ] && [ "$published" = "$actual" ]; then
+            ok "SHA-512 checksum verified"
+        else
+            rm -rf "$tmpdir"
+            die "WP-CLI checksum mismatch. Aborting."
+        fi
+    else
+        warn "Published checksum unavailable; falling back to a functional check only."
+    fi
+
     if ! php "$tmp" --info --allow-root &>/dev/null; then
-        rm -f "$tmp"
+        rm -rf "$tmpdir"
         die "The downloaded WP-CLI phar is not valid. Check connectivity and retry."
     fi
-    chmod +x "$tmp"
+    chmod 755 "$tmp"
     mv "$tmp" /usr/local/bin/wp
+    rm -rf "$tmpdir"
     ok "WP-CLI $(wp --info --allow-root 2>/dev/null | grep 'WP-CLI version' | awk '{print $NF}') installed"
 }
 
