@@ -415,6 +415,17 @@ sudo $C wp plugin update --all
 sudo $C permissions          # normalize what the update just wrote
 ```
 
+WP-CLI itself is not blocked by `DISALLOW_FILE_MODS` — with one exception:
+language packs go through `wp_is_file_mod_allowed()`, so translation updates
+need the constant off for the run.
+
+```sh
+sudo $C wp config set DISALLOW_FILE_MODS false --raw
+sudo $C wp language core update && sudo $C wp language plugin update --all
+sudo $C wp config set DISALLOW_FILE_MODS true --raw
+sudo $C permissions
+```
+
 To switch an installed site: edit `WP_WRITE_MODE`, re-run
 `sudo bin/console permissions`, and set the constants accordingly
 (`console wp config set DISALLOW_FILE_MODS true --raw`, or delete it and set
