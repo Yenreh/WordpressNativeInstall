@@ -87,7 +87,11 @@ All executables live in `bin/` and take `--config sites/<domain>.env`. When
 - `confirm` honours `ASSUME_YES` (`--yes`), so every prompt is skippable for
   unattended runs. Any new prompt must go through it.
 - `db_root` picks `mariadb` or `mysql`; scripts already run as root, so no
-  `sudo` inside them.
+  `sudo` inside them. Anything that connects **as the site user** goes through
+  `db_as_user <client>` (`db_client` / `db_dump_client` name the binary): it
+  writes the credentials to a temporary 0600 defaults file, because `-p<pass>`
+  on the command line is readable through `ps` by any local user. Never
+  reintroduce `-p"$DB_PASSWORD"`, and never put a password in a `-e` statement.
 - English only, no emojis, in code, comments, docs and commit messages.
 
 ## Configuration is derived, not repeated
@@ -101,13 +105,50 @@ fields to the config template that can be computed.
 `_REQUIRED_VARS` covers production fields only. Every `DEV_*` value is optional
 by design: a config written before the dev stack existed still works.
 
+## WP_WRITE_MODE (production file ownership)
+
+`derive_write_mode` in `lib/config.sh` turns one switch into ownership, modes and
+wp-config constants. **Do not split it into independent knobs**: `FS_METHOD=direct`
+over files PHP cannot write is a broken state that ends in wp-admin asking for
+FTP credentials.
+
+- `locked` (default): owner `WP_OWNER_USER` (root) group `WEB_GROUP`, only
+  `WP_WRITABLE_PATHS` (default `wp-content/uploads`) belongs to `WEB_USER`,
+  wp-config gets `DISALLOW_FILE_MODS`. Updates run through `bin/console wp` as
+  root — which also means WordPress background security updates are off, so the
+  installer prints the commands to schedule.
+- `dashboard`: `WEB_USER` owns everything, `FS_METHOD=direct`, `wp-content`
+  group-writable. Prior behaviour of this repo, now opt-in.
+
+`bin/console permissions` is the single implementation; `bin/install-wordpress`
+shells out to it. `bin/new-site --write-mode` writes the value into the config;
+`bin/install-wordpress --write-mode` overrides it for one run by exporting
+`WP_WRITE_MODE_OVERRIDE`, which `load_site_config` applies **after** sourcing the
+config (a plain variable would be overwritten by `source`) and which the spawned
+`console` process inherits. `bin/dev` ignores all of this: dev containers run as
+the invoking user.
+
 ## nginx template
 
 `nginx/site.conf.tpl` uses `{{TOKEN}}` placeholders rendered by `render_template`
 (pure bash string replacement, so passwords and slashes are safe). Tokens:
-`{{DOMAIN}} {{DOCROOT}} {{PHP_FPM_SOCK}} {{SSL_CERT}} {{SSL_KEY}} {{ACCESS_LOG}}
-{{ERROR_LOG}} {{CLIENT_MAX_BODY_SIZE}}`. `$host`, `$uri`, `$document_root` etc.
-are **nginx variables** — leave them alone.
+`{{DOMAIN}} {{SITE_KEY}} {{DOCROOT}} {{PHP_FPM_SOCK}} {{SSL_CERT}} {{SSL_KEY}}
+{{ACCESS_LOG}} {{ERROR_LOG}} {{CLIENT_MAX_BODY_SIZE}}`. `$host`, `$uri`,
+`$document_root` etc. are **nginx variables** — leave them alone.
+
+`{{SITE_KEY}}` is `NGINX_SITE_NAME` and exists to name the per-site
+`limit_req_zone` for `wp-login.php`. The zone is declared at http level (the
+rendered file is included there in both modes); two sites sharing a zone name
+would break `nginx -t`.
+
+**Location order is security-relevant.** nginx stops at the first matching regex
+location, so the `deny` blocks for `wp-content/uploads/*.php`, the metadata
+files and dotfiles must stay ABOVE `location ~ \.php$` — below it they are dead
+config while looking perfectly fine. `location = /wp-login.php` duplicates the
+fastcgi block on purpose (an exact match beats every regex, and that is how the
+rate limit is applied to it alone); keep the two copies in sync. Any location
+that defines its own `add_header` loses the server-level security headers and
+must repeat them.
 
 `NGINX_MODE` decides the layout: `nginxorg` -> `/etc/nginx/conf.d/<site>.conf`,
 `ubuntu` -> `sites-available` + symlink. The installer removes the file the other

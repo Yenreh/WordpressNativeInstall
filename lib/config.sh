@@ -75,6 +75,11 @@ load_site_config() {
     # shellcheck disable=SC1090
     source "$file"
 
+    # A command-line flag has to win over the file, and has to survive into the
+    # child processes a script spawns (the installer calls `console permissions`).
+    # An exported override is the only thing `source` cannot overwrite.
+    [ -n "${WP_WRITE_MODE_OVERRIDE:-}" ] && WP_WRITE_MODE="$WP_WRITE_MODE_OVERRIDE"
+
     SITE_CONFIG_FILE="$file"
     validate_site_config
     derive_site_config
@@ -103,6 +108,13 @@ validate_site_config() {
         /*) ;;
         *) die "WP_PATH must be an absolute path: $WP_PATH" ;;
     esac
+
+    # Both are interpolated raw into CREATE DATABASE / CREATE USER / GRANT
+    # statements that run as MariaDB root.
+    [[ "$DB_NAME" =~ ^[A-Za-z0-9_]+$ ]] \
+        || die "Invalid DB_NAME '${DB_NAME}': only letters, digits and underscores."
+    [[ "$DB_USER" =~ ^[A-Za-z0-9_]+$ ]] \
+        || die "Invalid DB_USER '${DB_USER}': only letters, digits and underscores."
 }
 
 # Everything derived from the values above, so a config file stays short.
@@ -138,7 +150,52 @@ derive_site_config() {
     WEB_USER="${WEB_USER:-www-data}"
     WEB_GROUP="${WEB_GROUP:-www-data}"
 
+    derive_write_mode
     derive_dev_config
+}
+
+# Who owns the WordPress files on a production host, and therefore what PHP can
+# rewrite while serving requests. This single switch drives ownership, file
+# modes and the matching wp-config.php constants, because splitting it produces
+# broken combinations (FS_METHOD=direct over files PHP cannot write).
+#
+#   locked    - the code belongs to WP_OWNER_USER (root) with group WEB_GROUP;
+#               only WP_WRITABLE_PATHS belong to the web user. PHP cannot alter
+#               a single line of the code it executes, so DISALLOW_FILE_MODS is
+#               set and every update goes through `bin/console wp` as root.
+#   dashboard - the web user owns everything and FS_METHOD=direct, so plugins,
+#               themes and core update themselves from wp-admin. Convenient, and
+#               it means any file-write bug rewrites the running code.
+#
+# The dev stack (bin/dev) ignores all of this: containers run as the invoking
+# user against a local Docker install that is never exposed.
+derive_write_mode() {
+    WP_WRITE_MODE="${WP_WRITE_MODE:-locked}"
+    case "$WP_WRITE_MODE" in
+        locked|dashboard) ;;
+        *) die "Invalid WP_WRITE_MODE '${WP_WRITE_MODE}'. Use 'locked' or 'dashboard'." ;;
+    esac
+
+    if [ "$WP_WRITE_MODE" = "locked" ]; then
+        WP_OWNER_USER="${WP_OWNER_USER:-root}"
+    else
+        WP_OWNER_USER="${WP_OWNER_USER:-$WEB_USER}"
+    fi
+    WP_OWNER_GROUP="${WP_OWNER_GROUP:-$WEB_GROUP}"
+
+    # Paths handed to the web user in either mode, colon-separated and relative
+    # to WP_PATH. Uploads is the only one WordPress itself needs at runtime; add
+    # a cache directory here when a plugin demands one.
+    WP_WRITABLE_PATHS="${WP_WRITABLE_PATHS:-wp-content/uploads}"
+
+    local rel
+    local IFS=':'
+    for rel in $WP_WRITABLE_PATHS; do
+        [ -n "$rel" ] || continue
+        case "$rel" in
+            /*|*..*) die "WP_WRITABLE_PATHS entry must be relative to WP_PATH and free of '..': $rel" ;;
+        esac
+    done
 }
 
 # Values used only by bin/dev (the Docker development stack). Every one of them
@@ -204,6 +261,7 @@ print_site_config() {
     echo "  WP path:      ${WP_PATH}"
     echo "  WP version:   ${WP_VERSION} (${SITE_LOCALE})"
     echo "  DB:           ${DB_NAME} @ ${DB_HOST}:${DB_PORT} (user ${DB_USER}, prefix ${DB_TABLE_PREFIX})"
+    echo "  Files:        ${WP_WRITE_MODE} (owner ${WP_OWNER_USER}:${WP_OWNER_GROUP}, ${WEB_USER} writes: ${WP_WRITABLE_PATHS})"
     echo "  PHP-FPM:      ${PHP_FPM_SOCK}"
     echo "  Nginx mode:   ${NGINX_MODE}"
     echo "  Nginx conf:   ${NGINX_CONF_FILE}"

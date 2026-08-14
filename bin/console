@@ -90,9 +90,9 @@ cmd_status() {
     fi
 
     section "Database"
-    if db_root -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" -e "USE \`${DB_NAME}\`;" &>/dev/null; then
+    if db_as_user "$(db_client)" -e "USE \`${DB_NAME}\`;" &>/dev/null; then
         local tables
-        tables=$(db_root -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" -sN \
+        tables=$(db_as_user "$(db_client)" -sN \
             -e "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='${DB_NAME}';" 2>/dev/null)
         ok "Connected to ${DB_NAME} as ${DB_USER} (${tables} tables)"
     else
@@ -118,16 +118,36 @@ cmd_permissions() {
     require_root
     [ -d "$WP_PATH" ] || die "Document root not found: ${WP_PATH}"
 
-    [ "$QUIET" = true ] || info "Applying permissions on ${WP_PATH}..."
+    [ "$QUIET" = true ] || info "Applying permissions on ${WP_PATH} (mode: ${WP_WRITE_MODE})..."
 
-    chown -R "${WEB_USER}:${WEB_GROUP}" "$WP_PATH"
+    # The whole tree first, then the exceptions.
+    chown -R "${WP_OWNER_USER}:${WP_OWNER_GROUP}" "$WP_PATH"
     find "$WP_PATH" -type d -exec chmod 755 {} +
     find "$WP_PATH" -type f -exec chmod 644 {} +
-    # wp-content must stay group-writable for plugin/theme installs and uploads.
-    [ -d "${WP_PATH}/wp-content" ] && chmod -R 775 "${WP_PATH}/wp-content"
+
+    if [ "$WP_WRITE_MODE" = "dashboard" ]; then
+        # The web user already owns everything here; the group bit is for a human
+        # added to WEB_GROUP who edits plugins and themes directly.
+        [ -d "${WP_PATH}/wp-content" ] && chmod -R g+w "${WP_PATH}/wp-content"
+    fi
+
+    # Directories PHP must write into at runtime, in both modes.
+    local rel target
+    local IFS=':'
+    for rel in $WP_WRITABLE_PATHS; do
+        [ -n "$rel" ] || continue
+        target="${WP_PATH}/${rel}"
+        mkdir -p "$target"
+        chown -R "${WEB_USER}:${WEB_GROUP}" "$target"
+        find "$target" -type d -exec chmod 755 {} +
+        find "$target" -type f -exec chmod 644 {} +
+    done
+    unset IFS
+
+    # 640 with group WEB_GROUP: PHP reads the credentials, nothing else does.
     [ -f "${WP_PATH}/wp-config.php" ] && chmod 640 "${WP_PATH}/wp-config.php"
 
-    [ "$QUIET" = true ] || ok "Permissions applied (dirs 755, files 644, wp-content 775, wp-config.php 640)"
+    [ "$QUIET" = true ] || ok "Owner ${WP_OWNER_USER}:${WP_OWNER_GROUP} | dirs 755 | files 644 | ${WEB_USER} writes ${WP_WRITABLE_PATHS} | wp-config.php 640"
 }
 
 cmd_nginx() {
@@ -150,10 +170,13 @@ cmd_ssl_renew() {
         confirm "Replace the existing certificate at ${SSL_CERT}?" || { info "Certificate kept."; return 0; }
     fi
 
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    # umask first: openssl creates the key under the current umask, so without
+    # this it exists world-readable until the chmod below runs.
+    ( umask 077
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "$SSL_KEY" -out "$SSL_CERT" \
         -subj "/CN=${SITE_DOMAIN}" \
-        -addext "subjectAltName=DNS:${SITE_DOMAIN}" 2>/dev/null
+        -addext "subjectAltName=DNS:${SITE_DOMAIN}" 2>/dev/null )
 
     chmod 600 "$SSL_KEY"
     chmod 644 "$SSL_CERT"
@@ -168,11 +191,8 @@ cmd_db_dump() {
         target="${REPO_ROOT}/backups/${DB_NAME}-$(date '+%Y%m%d-%H%M%S').sql"
     fi
 
-    local dump_cmd="mysqldump"
-    command -v mariadb-dump >/dev/null 2>&1 && dump_cmd="mariadb-dump"
-
     umask 077
-    "$dump_cmd" -u"${DB_USER}" -p"${DB_PASSWORD}" -h"${DB_HOST}" -P"${DB_PORT}" \
+    db_as_user "$(db_dump_client)" \
         --single-transaction --quick --default-character-set=utf8mb4 \
         "${DB_NAME}" > "$target"
 

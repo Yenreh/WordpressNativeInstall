@@ -134,3 +134,32 @@ db_root() {
         mysql "$@"
     fi
 }
+
+# Names of the available client binaries, MariaDB first.
+db_client()      { command -v mariadb      >/dev/null 2>&1 && echo mariadb      || echo mysql; }
+db_dump_client() { command -v mariadb-dump >/dev/null 2>&1 && echo mariadb-dump || echo mysqldump; }
+
+# db_as_user <client-binary> [args...] - run a client as DB_USER, reading
+# DB_USER/DB_PASSWORD/DB_HOST/DB_PORT from the loaded site config.
+#
+# The credentials travel in a temporary 0600 defaults file instead of on the
+# command line, where `-p<password>` would be readable through `ps` by every
+# local user for the lifetime of the process (a full dump, for instance).
+db_as_user() {
+    local client="$1"; shift
+    local cnf status=0
+
+    cnf="$(mktemp)" || die "Cannot create a temporary defaults file."
+    chmod 600 "$cnf"
+
+    # Option-file values are unescaped on read: protect backslashes first, then quotes.
+    local password="${DB_PASSWORD//\\/\\\\}"
+    password="${password//\"/\\\"}"
+    printf '[client]\nuser="%s"\npassword="%s"\nhost="%s"\nport="%s"\n' \
+        "$DB_USER" "$password" "$DB_HOST" "$DB_PORT" > "$cnf"
+
+    # --defaults-extra-file must come first, before any other option.
+    "$client" --defaults-extra-file="$cnf" "$@" || status=$?
+    rm -f "$cnf"
+    return "$status"
+}
